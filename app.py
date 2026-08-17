@@ -1,9 +1,13 @@
 """
-Pre-Market / On-Demand Macro Context Dashboard (v2 — compact dark layout)
+Pre-Market / On-Demand Macro Context Dashboard (v3 — professional dark UI)
 ---------------------------------------------------------------------------
-Same 8 data modules as v1, restructured into a compact 3-column card grid
-with normalized (% change) charts, a dark theme, and an analyst-style
-summary with explicit red flags at the top of the page.
+Layout:
+  Left column:  Index Futures -> Rates & Curve -> Oil & Metals
+  Right column: VIX Term Structure -> Credit Stress (HYG/LQD) -> Dollar Index
+  Full width:   Macro Calendar
+
+Requires .streamlit/config.toml (theme) alongside this file, plus a
+FRED_API_KEY set in Streamlit secrets.
 """
 
 import datetime as dt
@@ -28,28 +32,59 @@ FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 CALENDAR_KEYWORDS = ["CPI", "PCE", "Non-Farm", "NFP", "Nonfarm", "FOMC",
                      "Fed Funds", "Interest Rate", "Unemployment Claims", "Employment"]
 
-CHART_HEIGHT = 190
-DARK_BG = "#0e1117"
-PLOT_BG = "#161a23"
+# ---- palette (matches .streamlit/config.toml) -----------------------------
+BG_APP = "#0f1116"
+BG_CARD = "#171a21"
+BG_PLOT = "#1b1f28"
 GRID = "#2a2f3a"
-ACCENT_COLORS = ["#4fd1c5", "#f6ad55", "#63b3ed", "#fc8181", "#b794f4", "#68d391"]
+TEXT = "#e8e9ec"
+MUTED = "#9aa0ab"
+POS = "#34d399"
+NEG = "#f87171"
+ACCENT = "#2dd4bf"
+ACCENT2 = "#f59e0b"
+ACCENT3 = "#60a5fa"
+ACCENT4 = "#c084fc"
 
-# ---------------------------------------------------------------------------
-# Custom CSS — compact cards + dark polish (works with any Streamlit theme)
-# ---------------------------------------------------------------------------
-st.markdown("""
+CHART_HEIGHT = 230
+
+st.markdown(f"""
 <style>
-.block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1400px;}
-div[data-testid="stMetric"] {background-color: #161a23; border-radius: 8px;
-    padding: 8px 10px; border: 1px solid #262b36;}
-div[data-testid="stMetricLabel"] {font-size: 0.75rem; opacity: 0.75;}
-div[data-testid="stMetricValue"] {font-size: 1.1rem;}
-.card {background-color: #12151c; border: 1px solid #262b36; border-radius: 10px;
-       padding: 14px 16px; margin-bottom: 14px;}
-.card h4 {margin-top: 0; margin-bottom: 8px; font-size: 0.95rem; opacity: 0.9;}
-.small-caption {font-size: 0.72rem; opacity: 0.55; margin-top: 2px;}
-.flag-red {color: #fc8181; font-weight: 600;}
-.flag-ok {color: #68d391;}
+.block-container {{padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1500px;}}
+
+div[data-testid="stMetric"] {{
+    background-color: {BG_CARD}; border-radius: 8px; padding: 10px 12px;
+    border: 1px solid #262b36;
+}}
+div[data-testid="stMetricLabel"] p {{
+    font-size: 0.78rem !important; color: {MUTED} !important; font-weight: 500;
+}}
+div[data-testid="stMetricValue"] {{
+    font-size: 1.5rem !important; color: {TEXT} !important; font-weight: 600;
+}}
+div[data-testid="stMetricDelta"] svg {{ display: none; }}
+
+.card {{
+    background-color: {BG_CARD}; border-radius: 12px; padding: 20px 22px;
+    margin-bottom: 20px; border-left: 4px solid {ACCENT};
+}}
+.card-flag {{ border-left: 4px solid {NEG}; }}
+.card h4 {{
+    margin-top: 0; margin-bottom: 14px; font-size: 1.05rem; font-weight: 600;
+    color: {TEXT}; letter-spacing: 0.2px;
+}}
+.small-caption {{ font-size: 0.75rem; color: {MUTED}; margin-top: 6px; }}
+.flag-red {{ color: {NEG}; font-weight: 600; line-height: 1.6; }}
+.flag-ok {{ color: {POS}; font-weight: 500; }}
+.summary-box {{
+    background-color: {BG_CARD}; border-radius: 12px; padding: 20px 24px;
+    margin-bottom: 12px; font-size: 0.98rem; line-height: 1.7; color: {TEXT};
+    border-left: 4px solid {ACCENT};
+}}
+.impact-high {{ color: {NEG}; font-weight: 600; }}
+.impact-medium {{ color: {ACCENT2}; font-weight: 600; }}
+.impact-low {{ color: {MUTED}; }}
+[data-testid="stDataFrame"] {{ border-radius: 8px; overflow: hidden; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -102,6 +137,14 @@ def fetch_ff_calendar():
     return filtered, dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+def format_event_datetime(raw_date: str):
+    try:
+        d = dt.datetime.fromisoformat(raw_date)
+        return d.strftime("%b %d, %I:%M %p").replace(" 0", " ")
+    except Exception:
+        return raw_date
+
+
 # ---------------------------------------------------------------------------
 # Calculations
 # ---------------------------------------------------------------------------
@@ -144,8 +187,23 @@ def is_unusual(chg_1d_pct):
     return chg_1d_pct is not None and abs(chg_1d_pct) >= UNUSUAL_MOVE_PCT
 
 
-def normalized_chart(series_dict: dict, height=CHART_HEIGHT, y_title="% change"):
-    """Compact dark chart normalizing every series to % change from window start."""
+def base_layout(fig, height, legend=True):
+    fig.update_layout(
+        height=height, margin=dict(l=6, r=10, t=(34 if legend else 8), b=6),
+        paper_bgcolor=BG_CARD, plot_bgcolor=BG_PLOT,
+        font=dict(color=TEXT, size=12),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
+                     font=dict(size=11, color=MUTED)) if legend else dict(),
+        xaxis=dict(showgrid=False, tickfont=dict(size=10, color=MUTED),
+                    linecolor=GRID),
+        yaxis=dict(showgrid=True, gridcolor=GRID, tickfont=dict(size=10, color=MUTED),
+                    zerolinecolor=GRID),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def normalized_chart(series_dict: dict, colors, height=CHART_HEIGHT):
     fig = go.Figure()
     for i, (name, s) in enumerate(series_dict.items()):
         s = s.dropna()
@@ -153,43 +211,44 @@ def normalized_chart(series_dict: dict, height=CHART_HEIGHT, y_title="% change")
             continue
         norm = (s / s.iloc[0] - 1) * 100
         fig.add_trace(go.Scatter(x=norm.index, y=norm.values, mode="lines", name=name,
-                                  line=dict(width=2, color=ACCENT_COLORS[i % len(ACCENT_COLORS)])))
-    fig.update_layout(
-        height=height, margin=dict(l=4, r=4, t=4, b=4),
-        paper_bgcolor=DARK_BG, plot_bgcolor=PLOT_BG,
-        font=dict(color="#d7dae0", size=11),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
-        xaxis=dict(showgrid=False, tickfont=dict(size=9)),
-        yaxis=dict(showgrid=True, gridcolor=GRID, ticksuffix="%", tickfont=dict(size=9)),
-    )
-    return fig
+                                  line=dict(width=2.2, color=colors[i % len(colors)])))
+    fig.update_yaxes(ticksuffix="%")
+    return base_layout(fig, height, legend=True)
 
 
-def level_chart(series: pd.Series, height=CHART_HEIGHT, color=ACCENT_COLORS[0], ticksuffix=""):
-    """Chart on the raw scale (used for yields, single-series levels)."""
+def level_chart(series: pd.Series, color=ACCENT, height=CHART_HEIGHT, ticksuffix="", ticksprefix=""):
     fig = go.Figure()
     s = series.dropna()
     fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines",
-                              line=dict(width=2, color=color)))
-    fig.update_layout(
-        height=height, margin=dict(l=4, r=4, t=4, b=4),
-        paper_bgcolor=DARK_BG, plot_bgcolor=PLOT_BG,
-        font=dict(color="#d7dae0", size=11),
-        xaxis=dict(showgrid=False, tickfont=dict(size=9)),
-        yaxis=dict(showgrid=True, gridcolor=GRID, ticksuffix=ticksuffix, tickfont=dict(size=9)),
-    )
-    return fig
+                              line=dict(width=2.2, color=color), fill="tozeroy",
+                              fillcolor=color.replace(")", ", 0.08)").replace("rgb", "rgba")
+                              if color.startswith("rgb") else None))
+    fig.update_yaxes(ticksuffix=ticksuffix, tickprefix=ticksprefix)
+    return base_layout(fig, height, legend=False)
 
+
+def multi_level_chart(series_dict: dict, colors, height=CHART_HEIGHT, ticksuffix=""):
+    fig = go.Figure()
+    for i, (name, s) in enumerate(series_dict.items()):
+        s = s.dropna()
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=name,
+                                  line=dict(width=2.2, color=colors[i % len(colors)])))
+    fig.update_yaxes(ticksuffix=ticksuffix)
+    return base_layout(fig, height, legend=True)
+
+
+PALETTE = [ACCENT, ACCENT2, ACCENT3, ACCENT4]
 
 # ---------------------------------------------------------------------------
-# Phase 1 — fetch & compute everything up front (feeds both summary + cards)
+# Phase 1 — fetch & compute
 # ---------------------------------------------------------------------------
 
 data = {}
 red_flags = []
 notes = []
+flagged = {"rates": False, "futures": False, "commodities": False,
+           "vix": False, "dxy": False, "credit": False}
 
-# Rates
 if FRED_API_KEY:
     y2, as_of_2 = fetch_fred_series("DGS2")
     y10, as_of_10 = fetch_fred_series("DGS10")
@@ -207,10 +266,10 @@ if FRED_API_KEY:
                               trend_10s2s=trend_10s2s, as_of=as_of_10)
         if slope_10s2s < 0:
             red_flags.append(f"2s10s curve is **inverted** ({slope_10s2s:.0f} bps) — classic late-cycle/recession-risk signal.")
+            flagged["rates"] = True
         if trend_10s2s:
             notes.append(f"the 2s10s curve is {trend_10s2s} ({slope_10s2s:.0f} bps)")
 
-# Futures
 fut_hist = {}
 fut_rows = []
 for t, n in FUTURES.items():
@@ -230,9 +289,9 @@ if fut_rows:
         notes.append(f"equity futures show {'broad, aligned' if dispersion < 0.5 else 'narrow, divergent'} "
                      f"participation ({leader['name']} leading, {laggard['name']} lagging)")
         if dispersion >= 1.0:
-            red_flags.append(f"Wide dispersion across index futures ({dispersion:.1f} pts) — rally/selloff is narrow, not broad-based.")
+            red_flags.append(f"Wide dispersion across index futures ({dispersion:.1f} pts) — move is narrow, not broad-based.")
+            flagged["futures"] = True
 
-# Commodities
 com_hist = {}
 com_rows = []
 for t, n in COMMODITIES.items():
@@ -243,10 +302,10 @@ for t, n in COMMODITIES.items():
         com_rows.append({"name": n, **d})
         if is_unusual(d["chg_1d"]):
             red_flags.append(f"{n} moved {d['chg_1d']:+.1f}% today — unusual (≥{UNUSUAL_MOVE_PCT:.0f}%) move.")
+            flagged["commodities"] = True
 if com_rows:
     data["commodities"] = com_rows
 
-# VIX term structure
 vix_hist = {}
 vix_rows = []
 vix_levels = {}
@@ -264,19 +323,19 @@ if vix_rows:
     data["vix"] = dict(rows=vix_rows, ordered=ordered)
     if not ordered:
         red_flags.append("VIX term structure is inverted/backwardated — front-end fear rising faster than the back end.")
+        flagged["vix"] = True
     else:
         notes.append("the VIX term structure is in normal contango (calm)")
 
-# DXY
 dxy_hist, _ = fetch_yf_history(DXY_TICKER)
 if dxy_hist is not None:
     d = pct_changes(dxy_hist)
     data["dxy"] = d
     if d["chg_1d"] is not None and abs(d["chg_1d"]) >= 0.5:
         red_flags.append(f"Dollar Index moved {d['chg_1d']:+.2f}% today — a sizeable one-day FX move.")
+        flagged["dxy"] = True
     notes.append(f"the dollar is {'up' if (d['chg_1d'] or 0) >= 0 else 'down'} {abs(d['chg_1d'] or 0):.2f}% on the day")
 
-# Credit stress (HYG/LQD)
 hyg_hist, _ = fetch_yf_history("HYG")
 lqd_hist, _ = fetch_yf_history("LQD")
 if hyg_hist is not None and lqd_hist is not None:
@@ -287,9 +346,9 @@ if hyg_hist is not None and lqd_hist is not None:
     data["credit"] = dict(ratio=ratio, **d)
     if d["chg_1d"] is not None and d["chg_1d"] <= -0.5:
         red_flags.append(f"Credit stress proxy (HYG/LQD) fell {d['chg_1d']:.2f}% today — high-yield underperforming, a risk-off tell.")
+        flagged["credit"] = True
     notes.append(f"credit conditions ({'widening' if (d['chg_1d'] or 0) < 0 else 'stable-to-easing'})")
 
-# Calendar
 events, fetched_at = fetch_ff_calendar()
 data["calendar"] = events
 high_impact_soon = [e for e in events if str(e.get("impact", "")).lower() in ("high", "3")]
@@ -299,152 +358,187 @@ if high_impact_soon:
 
 
 # ---------------------------------------------------------------------------
-# Summary (analyst-style) — built from the flags/notes computed above
+# Header + summary
 # ---------------------------------------------------------------------------
 
-st.title("Macro Context Dashboard")
-if st.button("🔄 Refresh now"):
-    st.cache_data.clear()
-    st.rerun()
+top_l, top_r = st.columns([5, 1])
+with top_l:
+    st.title("Macro Context Dashboard")
+    st.caption("On-demand snapshot — not a live stream · ~20 min delay tolerated on market data · daily on yields")
+with top_r:
+    st.write("")
+    if st.button("🔄 Refresh", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 
-st.markdown("### Market read")
+st.markdown("#### Market read")
 
 if notes:
     narrative = ("Taking stock of the tape right now: " + "; ".join(notes) + ". " +
-                 ("No readings are outside normal ranges beyond what's flagged below." if red_flags
+                 ("Details on the flagged items are below." if red_flags
                   else "Nothing here is flashing outside of normal ranges — context is clean, no single factor "
                        "demands a defensive posture today."))
 else:
     narrative = "Not enough data loaded yet to form a read — check that your FRED key is set and refresh."
 
-st.markdown(f"<div class='card'>{narrative}</div>", unsafe_allow_html=True)
+st.markdown(f"<div class='summary-box'>{narrative}</div>", unsafe_allow_html=True)
 
 if red_flags:
-    st.markdown("**🚩 Red flags**")
-    for f in red_flags:
-        st.markdown(f"<div class='flag-red'>• {f}</div>", unsafe_allow_html=True)
+    flag_html = "<div class='summary-box' style='border-left-color:{0}'><b>🚩 Red flags</b><br><br>".format(NEG)
+    flag_html += "<br>".join(f"<span class='flag-red'>• {f}</span>" for f in red_flags)
+    flag_html += "</div>"
+    st.markdown(flag_html, unsafe_allow_html=True)
 else:
     st.markdown("<span class='flag-ok'>✓ No red flags triggered across rates, futures, commodities, "
                 "VIX shape, DXY, or credit at current thresholds.</span>", unsafe_allow_html=True)
 
-st.divider()
+st.write("")
 
 # ---------------------------------------------------------------------------
-# Phase 2 — compact 3-column card grid
+# Phase 2 — two-column layout
 # ---------------------------------------------------------------------------
 
-col1, col2, col3 = st.columns(3, gap="medium")
+left, right = st.columns(2, gap="large")
 
-# --- Column 1: Rates + DXY -----------------------------------------------
-with col1:
-    st.markdown("<div class='card'><h4>1 · Rates & Curve</h4>", unsafe_allow_html=True)
+with left:
+    # 2. Index Futures
+    cls = "card card-flag" if flagged["futures"] else "card"
+    st.markdown(f"<div class='{cls}'><h4>Index Futures</h4>", unsafe_allow_html=True)
+    if "futures" in data:
+        df = pd.DataFrame(data["futures"]).sort_values("chg_1d", ascending=False)
+        disp = df.rename(columns={"name": "Future", "last": "Last", "chg_1d": "1D",
+                                   "chg_1w": "1W", "chg_1m": "1M"})
+        for c in ["1D", "1W", "1M"]:
+            disp[c] = disp[c].apply(fmt_pct)
+        disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
+        st.dataframe(disp, hide_index=True, use_container_width=True, height=145)
+        st.plotly_chart(normalized_chart(fut_hist, PALETTE), use_container_width=True,
+                         config={"displayModeBar": False})
+        st.markdown(f"<div class='small-caption'>1D dispersion: {data.get('futures_dispersion', 0):.2f} pts "
+                    f"&nbsp;·&nbsp; yfinance, ~15-20 min delay</div>", unsafe_allow_html=True)
+    else:
+        st.error("Could not load futures data.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # 1. Rates & Curve
+    cls = "card card-flag" if flagged["rates"] else "card"
+    st.markdown(f"<div class='{cls}'><h4>Rates & Yield Curve</h4>", unsafe_allow_html=True)
     if "rates" in data:
         r = data["rates"]
         c1, c2, c3 = st.columns(3)
         c1.metric("2Y", f"{r['y2'].iloc[-1]:.2f}%", fmt_bps(r["c2"]["chg_1d"]))
         c2.metric("10Y", f"{r['y10'].iloc[-1]:.2f}%", fmt_bps(r["c10"]["chg_1d"]))
         c3.metric("30Y", f"{r['y30'].iloc[-1]:.2f}%", fmt_bps(r["c30"]["chg_1d"]))
-        st.caption(f"10s2s: {r['slope_10s2s']:.0f} bps ({r['trend_10s2s'] or '—'}) · "
-                    f"30s10s: {r['slope_30s10s']:.0f} bps")
-        st.plotly_chart(go.Figure(
-            data=[go.Scatter(x=r['y10'].tail(66).index, y=r['y10'].tail(66).values, name="10Y",
-                              line=dict(color=ACCENT_COLORS[0], width=2)),
-                  go.Scatter(x=r['y2'].tail(66).index, y=r['y2'].tail(66).values, name="2Y",
-                              line=dict(color=ACCENT_COLORS[1], width=2)),
-                  go.Scatter(x=r['y30'].tail(66).index, y=r['y30'].tail(66).values, name="30Y",
-                              line=dict(color=ACCENT_COLORS[2], width=2))]
-        ).update_layout(height=CHART_HEIGHT, margin=dict(l=4, r=4, t=4, b=4),
-                          paper_bgcolor=DARK_BG, plot_bgcolor=PLOT_BG,
-                          font=dict(color="#d7dae0", size=10),
-                          legend=dict(orientation="h", y=1.15, x=0, font=dict(size=9)),
-                          xaxis=dict(showgrid=False, tickfont=dict(size=9)),
-                          yaxis=dict(showgrid=True, gridcolor=GRID, ticksuffix="%", tickfont=dict(size=9))),
-                        use_container_width=True, config={"displayModeBar": False})
-        st.markdown(f"<div class='small-caption'>As of {r['as_of']} · FRED</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='small-caption'>10s2s: {r['slope_10s2s']:.0f} bps "
+                    f"({r['trend_10s2s'] or '—'}) &nbsp;·&nbsp; 30s10s: {r['slope_30s10s']:.0f} bps</div>",
+                    unsafe_allow_html=True)
+        st.write("")
+        chart_series = {"10Y": r["y10"].tail(66), "2Y": r["y2"].tail(66), "30Y": r["y30"].tail(66)}
+        st.plotly_chart(multi_level_chart(chart_series, PALETTE, ticksuffix="%"),
+                         use_container_width=True, config={"displayModeBar": False})
+        st.markdown(f"<div class='small-caption'>As of {r['as_of']} · FRED, official daily par yields</div>",
+                    unsafe_allow_html=True)
     else:
         st.warning("Add FRED_API_KEY in Secrets to enable this section.")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='card'><h4>6 · Dollar Index (DXY)</h4>", unsafe_allow_html=True)
-    if "dxy" in data:
-        d = data["dxy"]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("DXY", f"{d['last']:.2f}", fmt_pct(d["chg_1d"]))
-        c2.metric("1W", fmt_pct(d["chg_1w"]))
-        c3.metric("1M", fmt_pct(d["chg_1m"]))
-        st.plotly_chart(level_chart(dxy_hist.tail(22), color=ACCENT_COLORS[3]),
-                         use_container_width=True, config={"displayModeBar": False})
-    else:
-        st.error("Could not load DXY.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# --- Column 2: Futures + VIX ---------------------------------------------
-with col2:
-    st.markdown("<div class='card'><h4>2 · Index Futures</h4>", unsafe_allow_html=True)
-    if "futures" in data:
-        df = pd.DataFrame(data["futures"]).sort_values("chg_1d", ascending=False)
-        disp = df.copy()
-        for c in ["chg_1d", "chg_1w", "chg_1m"]:
-            disp[c] = disp[c].apply(fmt_pct)
-        disp = disp.rename(columns={"name": "Future", "last": "Last",
-                                     "chg_1d": "1D", "chg_1w": "1W", "chg_1m": "1M"})
-        st.dataframe(disp, hide_index=True, use_container_width=True, height=140)
-        st.plotly_chart(normalized_chart(fut_hist), use_container_width=True, config={"displayModeBar": False})
-        st.caption(f"Dispersion (1D): {data.get('futures_dispersion', 0):.2f} pts")
-    else:
-        st.error("Could not load futures data.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='card'><h4>5 · VIX Term Structure</h4>", unsafe_allow_html=True)
-    if "vix" in data:
-        df = pd.DataFrame(data["vix"]["rows"])
-        disp = df.copy()
-        for c in ["chg_1d", "chg_1w", "chg_1m"]:
-            disp[c] = disp[c].apply(fmt_pct)
-        disp = disp.rename(columns={"name": "Index", "last": "Last",
-                                     "chg_1d": "1D", "chg_1w": "1W", "chg_1m": "1M"})
-        st.dataframe(disp, hide_index=True, use_container_width=True, height=170)
-        st.plotly_chart(normalized_chart(vix_hist), use_container_width=True, config={"displayModeBar": False})
-        st.caption("Contango (calm)" if data["vix"]["ordered"] else "⚠️ Inverted (risk-off)")
-    else:
-        st.error("Could not load VIX data.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# --- Column 3: Commodities + Credit + Calendar ----------------------------
-with col3:
-    st.markdown("<div class='card'><h4>3-4 · Oil & Metals</h4>", unsafe_allow_html=True)
+    # 3-4. Oil & Metals
+    cls = "card card-flag" if flagged["commodities"] else "card"
+    st.markdown(f"<div class='{cls}'><h4>Oil & Metals</h4>", unsafe_allow_html=True)
     if "commodities" in data:
         df = pd.DataFrame(data["commodities"])
-        disp = df.copy()
-        for c in ["chg_1d", "chg_1w", "chg_1m"]:
+        disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
+                                   "chg_1w": "1W", "chg_1m": "1M"})
+        for c in ["1D", "1W", "1M"]:
             disp[c] = disp[c].apply(fmt_pct)
-        disp = disp.rename(columns={"name": "Asset", "last": "Last",
-                                     "chg_1d": "1D", "chg_1w": "1W", "chg_1m": "1M"})
-        st.dataframe(disp, hide_index=True, use_container_width=True, height=170)
-        st.plotly_chart(normalized_chart(com_hist), use_container_width=True, config={"displayModeBar": False})
+        disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
+        st.dataframe(disp, hide_index=True, use_container_width=True, height=175)
+        st.plotly_chart(normalized_chart(com_hist, PALETTE), use_container_width=True,
+                         config={"displayModeBar": False})
+        st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day)</div>",
+                    unsafe_allow_html=True)
     else:
         st.error("Could not load commodity data.")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='card'><h4>7 · Credit Stress (HYG/LQD)</h4>", unsafe_allow_html=True)
+with right:
+    # 5. VIX Term Structure
+    cls = "card card-flag" if flagged["vix"] else "card"
+    st.markdown(f"<div class='{cls}'><h4>VIX Term Structure</h4>", unsafe_allow_html=True)
+    if "vix" in data:
+        df = pd.DataFrame(data["vix"]["rows"])
+        disp = df.rename(columns={"name": "Index", "last": "Last", "chg_1d": "1D",
+                                   "chg_1w": "1W", "chg_1m": "1M"})
+        for c in ["1D", "1W", "1M"]:
+            disp[c] = disp[c].apply(fmt_pct)
+        disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
+        st.dataframe(disp, hide_index=True, use_container_width=True, height=175)
+        st.plotly_chart(normalized_chart(vix_hist, PALETTE), use_container_width=True,
+                         config={"displayModeBar": False})
+        shape_txt = "Contango (calm)" if data["vix"]["ordered"] else "⚠️ Inverted / backwardated (risk-off)"
+        st.markdown(f"<div class='small-caption'>Shape: {shape_txt}</div>", unsafe_allow_html=True)
+    else:
+        st.error("Could not load VIX data.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # 7. Credit stress
+    cls = "card card-flag" if flagged["credit"] else "card"
+    st.markdown(f"<div class='{cls}'><h4>Credit Stress (HYG / LQD)</h4>", unsafe_allow_html=True)
     if "credit" in data:
         d = data["credit"]
         c1, c2, c3 = st.columns(3)
         c1.metric("Ratio", f"{d['last']:.3f}", fmt_pct(d["chg_1d"]))
         c2.metric("1W", fmt_pct(d["chg_1w"]))
         c3.metric("1M", fmt_pct(d["chg_1m"]))
-        st.plotly_chart(level_chart(d["ratio"].tail(22), color=ACCENT_COLORS[4]),
+        st.write("")
+        st.plotly_chart(level_chart(d["ratio"].tail(22), color=ACCENT3),
                          use_container_width=True, config={"displayModeBar": False})
+        note = "Ratio falling → high-yield underperforming IG → credit stress widening." if (d["chg_1d"] or 0) < 0 \
+            else "Ratio rising → high-yield outperforming IG → credit conditions easing."
+        st.markdown(f"<div class='small-caption'>{note}</div>", unsafe_allow_html=True)
     else:
         st.error("Could not load credit data.")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='card'><h4>8 · Macro Calendar</h4>", unsafe_allow_html=True)
-    if data.get("calendar"):
-        cal_df = pd.DataFrame([{"Date": e.get("date", ""), "Event": e.get("title", ""),
-                                 "Impact": e.get("impact", "")} for e in data["calendar"]])
-        st.dataframe(cal_df, hide_index=True, use_container_width=True, height=170)
+    # 6. Dollar Index
+    cls = "card card-flag" if flagged["dxy"] else "card"
+    st.markdown(f"<div class='{cls}'><h4>Dollar Index (DXY)</h4>", unsafe_allow_html=True)
+    if "dxy" in data:
+        d = data["dxy"]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("DXY", f"{d['last']:.2f}", fmt_pct(d["chg_1d"]))
+        c2.metric("1W", fmt_pct(d["chg_1w"]))
+        c3.metric("1M", fmt_pct(d["chg_1m"]))
+        st.write("")
+        st.plotly_chart(level_chart(dxy_hist.tail(22), color=ACCENT2),
+                         use_container_width=True, config={"displayModeBar": False})
     else:
-        st.info("No matching USD events this week, or feed unavailable.")
-    st.markdown(f"<div class='small-caption'>Fetched {fetched_at}</div>", unsafe_allow_html=True)
+        st.error("Could not load DXY.")
     st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Full-width Macro Calendar
+# ---------------------------------------------------------------------------
+
+st.write("")
+st.markdown("<div class='card'><h4>Macro Calendar — CPI / NFP / FOMC / PCE (USD, this week)</h4>",
+            unsafe_allow_html=True)
+if data.get("calendar"):
+    rows = []
+    for e in data["calendar"]:
+        impact = str(e.get("impact", ""))
+        impact_class = {"high": "impact-high", "medium": "impact-medium", "low": "impact-low"}.get(
+            impact.lower(), "impact-low")
+        rows.append({
+            "When": format_event_datetime(e.get("date", "")),
+            "Event": e.get("title", ""),
+            "Impact": impact,
+            "_impact_class": impact_class,
+        })
+    cal_df = pd.DataFrame(rows)[["When", "Event", "Impact"]]
+    st.dataframe(cal_df, hide_index=True, use_container_width=True, height=190)
+else:
+    st.info("No matching USD events this week, or the calendar feed is unavailable.")
+st.markdown(f"<div class='small-caption'>Fetched {fetched_at} · ForexFactory public calendar feed, cached ~6h</div>",
+            unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
