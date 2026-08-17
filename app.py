@@ -1,17 +1,19 @@
 """
-Pre-Market / On-Demand Macro Context Dashboard (v4 — bug fixes)
+Pre-Market / On-Demand Macro Context Dashboard (v5)
 ---------------------------------------------------------------------------
-Fixes vs v3:
-  - ES=F missing: added retry logic (yfinance is occasionally flaky on the
-    first hit) + a cash-index fallback (^GSPC/^IXIC/^RUT) if the future
-    itself still fails after retries, so a section never silently drops.
-  - Credit stress & DXY charts: removed `fill="tozeroy"`, which was forcing
-    Plotly's autorange down to 0 and flattening the visible variation.
-    Charts now autorange tightly around the actual data range.
-  - Rates chart: fixed series order to 2Y -> 10Y -> 30Y (was 10Y -> 2Y -> 30Y).
-  - Market read: now writes an extended, analyst-style explanation for each
-    active red flag (why it matters, what to watch), staying brief only
-    when nothing is flagged.
+Changes vs v4:
+  - Rates card now shows an intraday reference for 10Y/30Y (via yfinance
+    ^TNX/^TYX) alongside the official FRED value, since FRED lags by
+    several days. No free intraday source exists for 2Y, so that stays
+    FRED-only (noted in the UI).
+  - Fixed the VIX (and general) % change bug: yfinance history occasionally
+    returns duplicate/out-of-order timestamps for a ticker, which silently
+    shifted the "previous day" lookup used for 1D/1W/1M % changes. History
+    is now de-duplicated by calendar date and sorted before any calculation.
+  - Added a sanity guard: if a computed 1-day % change is implausibly large
+    for that asset class, it's shown as "check" instead of a misleading
+    number, rather than silently displaying a bad calculation.
+  - Removed cross-asset correlation flag (not wanted).
 """
 
 import datetime as dt
@@ -35,6 +37,10 @@ FUTURES_FALLBACK = {"ES=F": ("^GSPC", "S&P 500 (cash, futures unavailable)"),
 COMMODITIES = {"CL=F": "Crude Oil (WTI)", "GC=F": "Gold", "SI=F": "Silver", "HG=F": "Copper"}
 VIX_TERM = ["^VIX9D", "^VIX", "^VIX3M", "^VIX6M"]
 DXY_TICKER = "DX-Y.NYB"
+
+# Sanity caps per asset class: a 1D % move beyond this is treated as a
+# likely data glitch rather than displayed at face value.
+SANITY_CAP_1D = {"vix": 20.0, "rate_intraday": 15.0, "default": 15.0}
 
 FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 CALENDAR_KEYWORDS = ["CPI", "PCE", "Non-Farm", "NFP", "Nonfarm", "FOMC",
@@ -92,6 +98,12 @@ div[data-testid="stMetricDelta"] svg {{ display: none; }}
 .impact-high {{ color: {NEG}; font-weight: 600; }}
 .impact-medium {{ color: {ACCENT2}; font-weight: 600; }}
 .impact-low {{ color: {MUTED}; }}
+.intraday-pill {{
+    display: inline-block; background-color: #1c212b; border: 1px solid #2a2f3a;
+    border-radius: 6px; padding: 6px 12px; margin-right: 8px; font-size: 0.85rem;
+    color: {TEXT};
+}}
+.intraday-pill b {{ color: {ACCENT3}; }}
 [data-testid="stDataFrame"] {{ border-radius: 8px; overflow: hidden; }}
 </style>
 """, unsafe_allow_html=True)
@@ -119,13 +131,28 @@ def fetch_fred_series(series_id: str, limit: int = 90):
     return df.set_index("date")["value"], as_of
 
 
+def _clean_history(hist: pd.DataFrame) -> pd.DataFrame:
+    """De-duplicate by calendar date and sort chronologically. yfinance
+    occasionally returns duplicate/out-of-order timestamps for a ticker,
+    which silently corrupts positional 1D/1W/1M lookbacks downstream."""
+    if hist is None or hist.empty:
+        return hist
+    hist = hist.copy()
+    hist.index = pd.to_datetime(hist.index).tz_localize(None) if hist.index.tz is not None \
+        else pd.to_datetime(hist.index)
+    hist["_date"] = hist.index.normalize()
+    hist = hist.sort_index()
+    hist = hist[~hist["_date"].duplicated(keep="last")]
+    return hist.drop(columns="_date")
+
+
 @st.cache_data(ttl=1200, show_spinner=False)
 def fetch_yf_history(ticker: str, period: str = "3mo", retries: int = 3):
-    """Fetch daily closes with retries — yfinance is occasionally flaky on
-    the first request for a given ticker (empty frame / transient timeout)."""
+    """Fetch daily closes with retries + de-duplication."""
     for attempt in range(retries):
         try:
             hist = yf.Ticker(ticker).history(period=period, interval="1d")
+            hist = _clean_history(hist)
             if hist is not None and not hist.empty:
                 closes = hist["Close"].dropna()
                 if not closes.empty:
@@ -135,6 +162,25 @@ def fetch_yf_history(ticker: str, period: str = "3mo", retries: int = 3):
             pass
         if attempt < retries - 1:
             time.sleep(0.7)
+    return None, None
+
+
+@st.cache_data(ttl=300, show_spinner=False)  # 5 min — this one is meant to be near-live
+def fetch_intraday_quote(ticker: str):
+    """Latest available price for an intraday reference (unofficial)."""
+    try:
+        hist = yf.Ticker(ticker).history(period="5d", interval="15m")
+        hist = _clean_history(hist) if hist is not None and not hist.empty else hist
+        if hist is not None and not hist.empty:
+            last = hist["Close"].dropna().iloc[-1]
+            ts = hist.index[-1]
+            return float(last), ts.strftime("%H:%M")
+    except Exception:
+        pass
+    # fall back to last daily close if intraday intervals aren't available
+    hist, as_of = fetch_yf_history(ticker, period="5d")
+    if hist is not None:
+        return float(hist.iloc[-1]), as_of
     return None, None
 
 
@@ -160,8 +206,6 @@ def format_event_datetime(raw_date: str):
 
 
 def fetch_future_with_fallback(ticker: str, label: str):
-    """Try the futures ticker; if it still fails after retries, fall back to
-    the corresponding cash index rather than silently dropping the row."""
     hist, as_of = fetch_yf_history(ticker)
     if hist is not None:
         return hist, label
@@ -177,10 +221,10 @@ def fetch_future_with_fallback(ticker: str, label: str):
 # Calculations
 # ---------------------------------------------------------------------------
 
-def pct_changes(series: pd.Series):
+def pct_changes(series: pd.Series, cap: float = None):
     s = series.dropna()
     if s.empty:
-        return {"last": None, "chg_1d": None, "chg_1w": None, "chg_1m": None}
+        return {"last": None, "chg_1d": None, "chg_1w": None, "chg_1m": None, "suspect_1d": False}
     last = s.iloc[-1]
 
     def chg(n):
@@ -188,7 +232,10 @@ def pct_changes(series: pd.Series):
             return (last / s.iloc[-1 - n] - 1) * 100
         return None
 
-    return {"last": last, "chg_1d": chg(1), "chg_1w": chg(5), "chg_1m": chg(21)}
+    chg_1d = chg(1)
+    suspect = cap is not None and chg_1d is not None and abs(chg_1d) > cap
+    return {"last": last, "chg_1d": (None if suspect else chg_1d),
+            "chg_1w": chg(5), "chg_1m": chg(21), "suspect_1d": suspect}
 
 
 def bps_changes(series: pd.Series):
@@ -203,7 +250,9 @@ def bps_changes(series: pd.Series):
     return {"last": last, "chg_1d": chg(1), "chg_1w": chg(5), "chg_1m": chg(21)}
 
 
-def fmt_pct(x):
+def fmt_pct(x, suspect=False):
+    if suspect:
+        return "⚠️ check"
     return "—" if x is None else f"{x:+.2f}%"
 
 
@@ -235,8 +284,6 @@ def base_layout(fig, height, legend=True, y_range=None):
 
 
 def tight_range(series: pd.Series, pad_frac: float = 0.12):
-    """Zoom the y-axis tightly around the data instead of Plotly defaulting
-    toward 0 — this is what makes small % variations actually visible."""
     lo, hi = float(series.min()), float(series.max())
     span = hi - lo
     if span == 0:
@@ -315,6 +362,10 @@ if FRED_API_KEY:
         if trend_10s2s:
             notes.append(f"the 2s10s curve is {trend_10s2s} ({slope_10s2s:.0f} bps)")
 
+# Intraday reference for 10Y/30Y (no free intraday source exists for 2Y)
+intraday_10y, intraday_10y_ts = fetch_intraday_quote("^TNX")
+intraday_30y, intraday_30y_ts = fetch_intraday_quote("^TYX")
+
 fut_hist = {}
 fut_rows = []
 for t, n in FUTURES.items():
@@ -358,7 +409,7 @@ vix_levels = {}
 for t in VIX_TERM:
     h, _ = fetch_yf_history(t)
     if h is not None:
-        d = pct_changes(h)
+        d = pct_changes(h, cap=SANITY_CAP_1D["vix"])
         label = t.replace("^", "")
         vix_hist[label] = h.tail(22)
         vix_rows.append({"name": label, **d})
@@ -404,7 +455,7 @@ if high_impact_soon:
 
 
 # ---------------------------------------------------------------------------
-# Market read (extended when flags are active, brief when clean)
+# Market read
 # ---------------------------------------------------------------------------
 
 def build_narrative():
@@ -422,49 +473,36 @@ def build_narrative():
             f"The 2s10s Treasury spread has moved into inversion, sitting at {r['slope_10s2s']:.0f} bps. "
             "Curve inversions have historically preceded economic slowdowns or Fed policy pivots by several "
             "quarters — it doesn't mean a recession is imminent, but it reflects the bond market pricing in "
-            "slower growth or future rate cuts relative to today's short-end pricing. Worth tracking whether "
-            "this deepens or reverses over the coming sessions rather than reacting to one print."
+            "slower growth or future rate cuts relative to today's short-end pricing."
         )
     if flagged["futures"]:
         parts.append(
             f"Index futures show a same-day dispersion of {data.get('futures_dispersion', 0):.2f} points between "
-            f"{data.get('futures_leader', 'the leader')} and {data.get('futures_laggard', 'the laggard')}. That "
-            "kind of spread means today's move is concentrated in a specific market segment (large-cap growth vs. "
-            "small-cap/cyclicals, for instance) rather than a broad, healthy risk-on move — it's worth checking "
-            "what's driving the split (rates, a single mega-cap name, sector rotation) before reading directional "
-            "conviction into the headline index number."
+            f"{data.get('futures_leader', 'the leader')} and {data.get('futures_laggard', 'the laggard')} — "
+            "today's move is concentrated in a specific market segment rather than broad-based."
         )
     if flagged["commodities"]:
         moves = [f"{r['name']} {r['chg_1d']:+.1f}%" for r in data.get("commodities", []) if is_unusual(r["chg_1d"])]
         parts.append(
-            f"One or more commodities crossed the {UNUSUAL_MOVE_PCT:.0f}% single-day threshold ({', '.join(moves)}). "
-            "Moves of this size in a single session tend to bleed into inflation expectations, input costs, and "
-            "related equity sectors (energy, materials, miners) — worth identifying the catalyst (supply shock, "
-            "dollar move, geopolitical headline, positioning unwind) rather than dismissing it as noise."
+            f"One or more commodities crossed the {UNUSUAL_MOVE_PCT:.0f}% single-day threshold ({', '.join(moves)}), "
+            "worth tracing back to a specific catalyst rather than dismissing as noise."
         )
     if flagged["vix"]:
         parts.append(
-            "The VIX term structure has flipped into backwardation — near-term implied volatility (VIX9D) is now "
-            "pricing higher fear than the longer-dated tenors (VIX3M/VIX6M). This is the opposite of the normal, "
-            "calm upward-sloping shape, and historically this pattern shows up right before or during acute "
-            "equity drawdowns, since it reflects options markets pricing an immediate, near-term shock rather than "
-            "steady-state risk. Of everything on this board, this is typically the most actionable single flag."
+            "The VIX term structure has flipped into backwardation — near-term implied volatility is pricing "
+            "higher fear than longer-dated tenors, the classic signature of acute, immediate risk perception."
         )
     if flagged["dxy"]:
         d = data["dxy"]
         parts.append(
-            f"The Dollar Index moved {d['chg_1d']:+.2f}% in a single session — an unusually large one-day move for "
-            "DXY. Swings of this size tend to ripple through commodities (which are dollar-denominated and move "
-            "inversely), emerging-market assets, and multinational earnings translation. Worth cross-referencing "
-            "against today's macro calendar for a rate decision, Fed commentary, or major data surprise as the likely driver."
+            f"The Dollar Index moved {d['chg_1d']:+.2f}% in a single session — worth cross-referencing against "
+            "today's macro calendar for a rate or data-driven catalyst."
         )
     if flagged["credit"]:
         d = data["credit"]
         parts.append(
-            f"The HYG/LQD credit stress proxy fell {d['chg_1d']:.2f}% today, meaning high-yield bonds "
-            "underperformed investment-grade. Credit markets often lead equities at inflection points — a "
-            "persistent widening trend here over the next several sessions would be a more reliable early-warning "
-            "signal than equity price action alone, so this is worth monitoring for follow-through rather than a one-off."
+            f"The HYG/LQD credit stress proxy fell {d['chg_1d']:.2f}% today — worth monitoring for follow-through "
+            "over the next few sessions rather than treating a single-day move as conclusive."
         )
     return "<br><br>".join(parts)
 
@@ -513,7 +551,8 @@ with left:
         for c in ["1D", "1W", "1M"]:
             disp[c] = disp[c].apply(fmt_pct)
         disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(disp, hide_index=True, use_container_width=True, height=145)
+        st.dataframe(disp[["Future", "Last", "1D", "1W", "1M"]], hide_index=True,
+                     use_container_width=True, height=145)
         st.plotly_chart(normalized_chart(fut_hist, PALETTE), use_container_width=True,
                          config={"displayModeBar": False})
         st.markdown(f"<div class='small-caption'>1D dispersion: {data.get('futures_dispersion', 0):.2f} pts "
@@ -530,15 +569,30 @@ with left:
         c1.metric("2Y", f"{r['y2'].iloc[-1]:.2f}%", fmt_bps(r["c2"]["chg_1d"]))
         c2.metric("10Y", f"{r['y10'].iloc[-1]:.2f}%", fmt_bps(r["c10"]["chg_1d"]))
         c3.metric("30Y", f"{r['y30'].iloc[-1]:.2f}%", fmt_bps(r["c30"]["chg_1d"]))
-        st.markdown(f"<div class='small-caption'>10s2s: {r['slope_10s2s']:.0f} bps "
+
+        intraday_html = "<div style='margin-top:10px;'>"
+        if intraday_10y is not None:
+            diff10 = (intraday_10y - r["y10"].iloc[-1]) * 100
+            intraday_html += (f"<span class='intraday-pill'>Intraday 10Y: <b>{intraday_10y:.2f}%</b> "
+                               f"({diff10:+.0f} bps vs FRED, {intraday_10y_ts})</span>")
+        if intraday_30y is not None:
+            diff30 = (intraday_30y - r["y30"].iloc[-1]) * 100
+            intraday_html += (f"<span class='intraday-pill'>Intraday 30Y: <b>{intraday_30y:.2f}%</b> "
+                               f"({diff30:+.0f} bps vs FRED, {intraday_30y_ts})</span>")
+        intraday_html += "</div>"
+        st.markdown(intraday_html, unsafe_allow_html=True)
+        st.markdown("<div class='small-caption'>No free intraday source for 2Y — 2Y stays FRED-only.</div>",
+                    unsafe_allow_html=True)
+
+        st.markdown(f"<div class='small-caption' style='margin-top:8px;'>10s2s: {r['slope_10s2s']:.0f} bps "
                     f"({r['trend_10s2s'] or '—'}) &nbsp;·&nbsp; 30s10s: {r['slope_30s10s']:.0f} bps</div>",
                     unsafe_allow_html=True)
         st.write("")
         chart_series = {"2Y": r["y2"].tail(66), "10Y": r["y10"].tail(66), "30Y": r["y30"].tail(66)}
         st.plotly_chart(multi_level_chart(chart_series, PALETTE, ticksuffix="%"),
                          use_container_width=True, config={"displayModeBar": False})
-        st.markdown(f"<div class='small-caption'>As of {r['as_of']} · FRED, official daily par yields</div>",
-                    unsafe_allow_html=True)
+        st.markdown(f"<div class='small-caption'>Official curve as of {r['as_of']} · FRED, daily par yields. "
+                    f"Intraday pills above are unofficial (yfinance).</div>", unsafe_allow_html=True)
     else:
         st.warning("Add FRED_API_KEY in Secrets to enable this section.")
     st.markdown("</div>", unsafe_allow_html=True)
@@ -552,7 +606,8 @@ with left:
         for c in ["1D", "1W", "1M"]:
             disp[c] = disp[c].apply(fmt_pct)
         disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(disp, hide_index=True, use_container_width=True, height=175)
+        st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
+                     use_container_width=True, height=175)
         st.plotly_chart(normalized_chart(com_hist, PALETTE), use_container_width=True,
                          config={"displayModeBar": False})
         st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day)</div>",
@@ -568,10 +623,16 @@ with right:
         df = pd.DataFrame(data["vix"]["rows"])
         disp = df.rename(columns={"name": "Index", "last": "Last", "chg_1d": "1D",
                                    "chg_1w": "1W", "chg_1m": "1M"})
-        for c in ["1D", "1W", "1M"]:
-            disp[c] = disp[c].apply(fmt_pct)
+        disp["1D"] = df.apply(lambda row: fmt_pct(row["chg_1d"], row.get("suspect_1d", False)), axis=1)
+        disp["1W"] = df["chg_1w"].apply(fmt_pct)
+        disp["1M"] = df["chg_1m"].apply(fmt_pct)
         disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(disp, hide_index=True, use_container_width=True, height=175)
+        st.dataframe(disp[["Index", "Last", "1D", "1W", "1M"]], hide_index=True,
+                     use_container_width=True, height=175)
+        if df.get("suspect_1d", pd.Series(dtype=bool)).any():
+            st.markdown("<div class='small-caption'>⚠️ One or more 1D changes exceeded the sanity threshold "
+                        f"(±{SANITY_CAP_1D['vix']:.0f}%) and were suppressed as likely data glitches rather than "
+                        "shown at face value.</div>", unsafe_allow_html=True)
         st.plotly_chart(normalized_chart(vix_hist, PALETTE), use_container_width=True,
                          config={"displayModeBar": False})
         shape_txt = "Contango (calm)" if data["vix"]["ordered"] else "⚠️ Inverted / backwardated (risk-off)"
