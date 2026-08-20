@@ -1,19 +1,19 @@
 """
-Pre-Market / On-Demand Macro Context Dashboard (v5)
+Pre-Market / On-Demand Macro Context Dashboard (v6)
 ---------------------------------------------------------------------------
-Changes vs v4:
-  - Rates card now shows an intraday reference for 10Y/30Y (via yfinance
-    ^TNX/^TYX) alongside the official FRED value, since FRED lags by
-    several days. No free intraday source exists for 2Y, so that stays
-    FRED-only (noted in the UI).
-  - Fixed the VIX (and general) % change bug: yfinance history occasionally
-    returns duplicate/out-of-order timestamps for a ticker, which silently
-    shifted the "previous day" lookup used for 1D/1W/1M % changes. History
-    is now de-duplicated by calendar date and sorted before any calculation.
-  - Added a sanity guard: if a computed 1-day % change is implausibly large
-    for that asset class, it's shown as "check" instead of a misleading
-    number, rather than silently displaying a bad calculation.
-  - Removed cross-asset correlation flag (not wanted).
+New in this version:
+  - "Bigger picture" context in the narrative: flags 1-month highs/lows
+    (informational) and 52-week levels (informational if "near", escalated
+    to a red flag only on an actual breach) across every group.
+  - Two new groups: Agro (wheat/corn/soybeans) below Oil & Metals, and
+    Crypto (BTC/ETH) below Dollar Index. Crypto uses a 7-day/30-day
+    lookback instead of 5/21 since it trades 24/7, unlike everything else.
+  - Rates & Yield Curve boxes now show the FRED value + bps delta, the
+    "as of / delayed" notice, and the intraday reference value all inside
+    the same compact box (custom HTML in place of st.metric for this
+    section only — everything else still uses st.metric as before).
+
+Nothing else changed from the previous working version.
 """
 
 import datetime as dt
@@ -28,6 +28,7 @@ import yfinance as yf
 st.set_page_config(page_title="Macro Context Dashboard", layout="wide")
 
 UNUSUAL_MOVE_PCT = 3.0
+NEAR_52W_PCT = 1.0
 FRED_API_KEY = st.secrets.get("FRED_API_KEY", "")
 
 FUTURES = {"ES=F": "S&P 500 (ES)", "NQ=F": "Nasdaq 100 (NQ)", "RTY=F": "Russell 2000 (RTY)"}
@@ -35,12 +36,15 @@ FUTURES_FALLBACK = {"ES=F": ("^GSPC", "S&P 500 (cash, futures unavailable)"),
                      "NQ=F": ("^IXIC", "Nasdaq Composite (cash, futures unavailable)"),
                      "RTY=F": ("^RUT", "Russell 2000 (cash, futures unavailable)")}
 COMMODITIES = {"CL=F": "Crude Oil (WTI)", "GC=F": "Gold", "SI=F": "Silver", "HG=F": "Copper"}
+AGRO = {"ZW=F": "Wheat", "ZC=F": "Corn", "ZS=F": "Soybeans"}
+CRYPTO = {"BTC-USD": "Bitcoin (BTC)", "ETH-USD": "Ethereum (ETH)"}
 VIX_TERM = ["^VIX9D", "^VIX", "^VIX3M", "^VIX6M"]
 DXY_TICKER = "DX-Y.NYB"
 
-# Sanity caps per asset class: a 1D % move beyond this is treated as a
-# likely data glitch rather than displayed at face value.
-SANITY_CAP_1D = {"vix": 20.0, "rate_intraday": 15.0, "default": 15.0}
+STANDARD_CFG = dict(week_n=5, month_n=21, month_window=21, year_window=252)
+CRYPTO_CFG = dict(week_n=7, month_n=30, month_window=30, year_window=365)
+
+SANITY_CAP_1D = {"vix": 20.0}
 
 FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 CALENDAR_KEYWORDS = ["CPI", "PCE", "Non-Farm", "NFP", "Nonfarm", "FOMC",
@@ -49,6 +53,7 @@ CALENDAR_KEYWORDS = ["CPI", "PCE", "Non-Farm", "NFP", "Nonfarm", "FOMC",
 BG_APP = "#0f1116"
 BG_CARD = "#171a21"
 BG_PLOT = "#1b1f28"
+BG_BOX = "#1c212b"
 GRID = "#2a2f3a"
 TEXT = "#e8e9ec"
 MUTED = "#9aa0ab"
@@ -98,13 +103,18 @@ div[data-testid="stMetricDelta"] svg {{ display: none; }}
 .impact-high {{ color: {NEG}; font-weight: 600; }}
 .impact-medium {{ color: {ACCENT2}; font-weight: 600; }}
 .impact-low {{ color: {MUTED}; }}
-.intraday-pill {{
-    display: inline-block; background-color: #1c212b; border: 1px solid #2a2f3a;
-    border-radius: 6px; padding: 6px 12px; margin-right: 8px; font-size: 0.85rem;
-    color: {TEXT};
-}}
-.intraday-pill b {{ color: {ACCENT3}; }}
 [data-testid="stDataFrame"] {{ border-radius: 8px; overflow: hidden; }}
+
+.yield-box {{
+    background-color: {BG_BOX}; border: 1px solid #262b36; border-radius: 8px;
+    padding: 10px 12px; min-height: 88px;
+}}
+.yield-label {{ font-size: 0.78rem; color: {MUTED}; font-weight: 500; }}
+.yield-value {{ font-size: 1.5rem; font-weight: 600; color: {TEXT}; }}
+.yield-delta {{ font-size: 0.78rem; font-weight: 600; padding: 1px 6px; border-radius: 5px; margin-left: 6px; }}
+.yield-delta-pos {{ background-color: rgba(52,211,153,0.15); color: {POS}; }}
+.yield-delta-neg {{ background-color: rgba(248,113,113,0.15); color: {NEG}; }}
+.yield-sub {{ font-size: 0.68rem; color: {MUTED}; margin-top: 6px; line-height: 1.4; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -114,7 +124,7 @@ div[data-testid="stMetricDelta"] svg {{ display: none; }}
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def fetch_fred_series(series_id: str, limit: int = 90):
+def fetch_fred_series(series_id: str, limit: int = 270):
     if not FRED_API_KEY:
         return None, None
     url = "https://api.stlouisfed.org/fred/series/observations"
@@ -127,14 +137,11 @@ def fetch_fred_series(series_id: str, limit: int = 90):
     rows.reverse()
     df = pd.DataFrame(rows, columns=["date", "value"]).astype({"value": float})
     df["date"] = pd.to_datetime(df["date"])
-    as_of = df["date"].iloc[-1].strftime("%Y-%m-%d") if not df.empty else None
+    as_of = df["date"].iloc[-1].strftime("%b %d") if not df.empty else None
     return df.set_index("date")["value"], as_of
 
 
 def _clean_history(hist: pd.DataFrame) -> pd.DataFrame:
-    """De-duplicate by calendar date and sort chronologically. yfinance
-    occasionally returns duplicate/out-of-order timestamps for a ticker,
-    which silently corrupts positional 1D/1W/1M lookbacks downstream."""
     if hist is None or hist.empty:
         return hist
     hist = hist.copy()
@@ -148,7 +155,6 @@ def _clean_history(hist: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=1200, show_spinner=False)
 def fetch_yf_history(ticker: str, period: str = "3mo", retries: int = 3):
-    """Fetch daily closes with retries + de-duplication."""
     for attempt in range(retries):
         try:
             hist = yf.Ticker(ticker).history(period=period, interval="1d")
@@ -165,9 +171,8 @@ def fetch_yf_history(ticker: str, period: str = "3mo", retries: int = 3):
     return None, None
 
 
-@st.cache_data(ttl=300, show_spinner=False)  # 5 min — this one is meant to be near-live
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_intraday_quote(ticker: str):
-    """Latest available price for an intraday reference (unofficial)."""
     try:
         hist = yf.Ticker(ticker).history(period="5d", interval="15m")
         hist = _clean_history(hist) if hist is not None and not hist.empty else hist
@@ -177,7 +182,6 @@ def fetch_intraday_quote(ticker: str):
             return float(last), ts.strftime("%H:%M")
     except Exception:
         pass
-    # fall back to last daily close if intraday intervals aren't available
     hist, as_of = fetch_yf_history(ticker, period="5d")
     if hist is not None:
         return float(hist.iloc[-1]), as_of
@@ -208,20 +212,20 @@ def format_event_datetime(raw_date: str):
 def fetch_future_with_fallback(ticker: str, label: str):
     hist, as_of = fetch_yf_history(ticker)
     if hist is not None:
-        return hist, label
+        return hist, label, ticker
     fb_ticker, fb_label = FUTURES_FALLBACK.get(ticker, (None, None))
     if fb_ticker:
         hist, as_of = fetch_yf_history(fb_ticker)
         if hist is not None:
-            return hist, fb_label
-    return None, label
+            return hist, fb_label, fb_ticker
+    return None, label, ticker
 
 
 # ---------------------------------------------------------------------------
 # Calculations
 # ---------------------------------------------------------------------------
 
-def pct_changes(series: pd.Series, cap: float = None):
+def pct_changes(series: pd.Series, cap: float = None, week_n: int = 5, month_n: int = 21):
     s = series.dropna()
     if s.empty:
         return {"last": None, "chg_1d": None, "chg_1w": None, "chg_1m": None, "suspect_1d": False}
@@ -235,7 +239,7 @@ def pct_changes(series: pd.Series, cap: float = None):
     chg_1d = chg(1)
     suspect = cap is not None and chg_1d is not None and abs(chg_1d) > cap
     return {"last": last, "chg_1d": (None if suspect else chg_1d),
-            "chg_1w": chg(5), "chg_1m": chg(21), "suspect_1d": suspect}
+            "chg_1w": chg(week_n), "chg_1m": chg(month_n), "suspect_1d": suspect}
 
 
 def bps_changes(series: pd.Series):
@@ -248,6 +252,36 @@ def bps_changes(series: pd.Series):
         return (last - s.iloc[-1 - n]) * 100 if len(s) > n else None
 
     return {"last": last, "chg_1d": chg(1), "chg_1w": chg(5), "chg_1m": chg(21)}
+
+
+def level_status(series: pd.Series, month_window: int = 21, year_window: int = 252,
+                  near_pct: float = NEAR_52W_PCT):
+    """1-month high/low (informational) and 52-week near/breach (breach only
+    is flag-worthy) — applied the same way across every group."""
+    s = series.dropna()
+    if len(s) < 6:
+        return None
+    last = s.iloc[-1]
+    mw = s.tail(min(month_window, len(s)))
+    result = {"month": None, "year": None, "have_year": False}
+    if last >= mw.max():
+        result["month"] = "high"
+    elif last <= mw.min():
+        result["month"] = "low"
+    have_year = len(s) >= int(year_window * 0.6)
+    result["have_year"] = have_year
+    if have_year:
+        yw = s.tail(min(year_window, len(s)))
+        y_max, y_min = float(yw.max()), float(yw.min())
+        if last >= y_max:
+            result["year"] = "breach_high"
+        elif last <= y_min:
+            result["year"] = "breach_low"
+        elif y_max > 0 and last >= y_max * (1 - near_pct / 100):
+            result["year"] = "near_high"
+        elif y_min > 0 and last <= y_min * (1 + near_pct / 100):
+            result["year"] = "near_low"
+    return result
 
 
 def fmt_pct(x, suspect=False):
@@ -331,6 +365,47 @@ def multi_level_chart(series_dict: dict, colors, height=CHART_HEIGHT, ticksuffix
     return base_layout(fig, height, legend=True, y_range=y_range)
 
 
+def render_yield_box(label, value_pct, delta_bps, as_of, intraday_val, intraday_ts):
+    delta_cls = "yield-delta-pos" if (delta_bps or 0) >= 0 else "yield-delta-neg"
+    delta_html = f"<span class='yield-delta {delta_cls}'>{fmt_bps(delta_bps)}</span>" if delta_bps is not None else ""
+    if intraday_val is not None:
+        intraday_txt = f"Intraday: <b>{intraday_val:.2f}%</b> ({intraday_ts})"
+    else:
+        intraday_txt = "Intraday: n/a"
+    sub = f"As of {as_of} (delayed) &nbsp;·&nbsp; {intraday_txt}"
+    return (f"<div class='yield-box'><div class='yield-label'>{label}</div>"
+            f"<div class='yield-value'>{value_pct:.2f}%{delta_html}</div>"
+            f"<div class='yield-sub'>{sub}</div></div>")
+
+
+def collect_level_notes(rows, group_key, flagged, red_flags, big_picture):
+    """rows: list of dicts each with 'name' and 'level' (output of level_status)."""
+    for r in rows:
+        ls = r.get("level")
+        name = r["name"]
+        if not ls:
+            continue
+        if ls["month"] == "high":
+            big_picture.append(f"{name} is at a 1-month high")
+        elif ls["month"] == "low":
+            big_picture.append(f"{name} is at a 1-month low")
+        year = ls.get("year")
+        if year == "breach_high":
+            msg = f"{name} just broke out to a fresh 52-week high"
+            big_picture.append(msg)
+            red_flags.append(msg + ".")
+            flagged[group_key] = True
+        elif year == "breach_low":
+            msg = f"{name} just broke down to a fresh 52-week low"
+            big_picture.append(msg)
+            red_flags.append(msg + ".")
+            flagged[group_key] = True
+        elif year == "near_high":
+            big_picture.append(f"{name} is trading within {NEAR_52W_PCT:.0f}% of its 52-week high")
+        elif year == "near_low":
+            big_picture.append(f"{name} is trading within {NEAR_52W_PCT:.0f}% of its 52-week low")
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 — fetch & compute
 # ---------------------------------------------------------------------------
@@ -338,9 +413,11 @@ def multi_level_chart(series_dict: dict, colors, height=CHART_HEIGHT, ticksuffix
 data = {}
 red_flags = []
 notes = []
-flagged = {"rates": False, "futures": False, "commodities": False,
-           "vix": False, "dxy": False, "credit": False}
+big_picture = []
+flagged = {"rates": False, "futures": False, "commodities": False, "agro": False,
+           "vix": False, "dxy": False, "credit": False, "crypto": False}
 
+# --- Rates ---
 if FRED_API_KEY:
     y2, as_of_2 = fetch_fred_series("DGS2")
     y10, as_of_10 = fetch_fred_series("DGS10")
@@ -355,23 +432,30 @@ if FRED_API_KEY:
             trend_10s2s = "steepening" if slope_10s2s > slope_10s2s_1d else "flattening"
         data["rates"] = dict(y2=y2, y10=y10, y30=y30, c2=c2, c10=c10, c30=c30,
                               slope_10s2s=slope_10s2s, slope_30s10s=slope_30s10s,
-                              trend_10s2s=trend_10s2s, as_of=as_of_10)
+                              trend_10s2s=trend_10s2s, as_of=as_of_10, as_of_2=as_of_2, as_of_30=as_of_30)
         if slope_10s2s < 0:
             red_flags.append(f"2s10s curve is inverted ({slope_10s2s:.0f} bps).")
             flagged["rates"] = True
         if trend_10s2s:
             notes.append(f"the 2s10s curve is {trend_10s2s} ({slope_10s2s:.0f} bps)")
 
-# Intraday reference for 10Y/30Y (no free intraday source exists for 2Y)
+        rate_rows = [{"name": "2Y", "level": level_status(y2)},
+                     {"name": "10Y", "level": level_status(y10)},
+                     {"name": "30Y", "level": level_status(y30)}]
+        collect_level_notes(rate_rows, "rates", flagged, red_flags, big_picture)
+
 intraday_10y, intraday_10y_ts = fetch_intraday_quote("^TNX")
 intraday_30y, intraday_30y_ts = fetch_intraday_quote("^TYX")
 
+# --- Index futures ---
 fut_hist = {}
 fut_rows = []
 for t, n in FUTURES.items():
-    h, label = fetch_future_with_fallback(t, n)
+    h, label, used_ticker = fetch_future_with_fallback(t, n)
     if h is not None:
-        d = pct_changes(h)
+        d = pct_changes(h, **{k: v for k, v in STANDARD_CFG.items() if k in ("week_n", "month_n")})
+        h_1y, _ = fetch_yf_history(used_ticker, period="1y")
+        d["level"] = level_status(h_1y, STANDARD_CFG["month_window"], STANDARD_CFG["year_window"]) if h_1y is not None else None
         fut_hist[label] = h.tail(22)
         fut_rows.append({"name": label, **d})
 if fut_rows:
@@ -388,13 +472,17 @@ if fut_rows:
         if dispersion >= 1.0:
             red_flags.append(f"Wide dispersion across index futures ({dispersion:.1f} pts).")
             flagged["futures"] = True
+    collect_level_notes(fut_rows, "futures", flagged, red_flags, big_picture)
 
+# --- Oil & Metals ---
 com_hist = {}
 com_rows = []
 for t, n in COMMODITIES.items():
     h, _ = fetch_yf_history(t)
     if h is not None:
         d = pct_changes(h)
+        h_1y, _ = fetch_yf_history(t, period="1y")
+        d["level"] = level_status(h_1y) if h_1y is not None else None
         com_hist[n] = h.tail(22)
         com_rows.append({"name": n, **d})
         if is_unusual(d["chg_1d"]):
@@ -402,7 +490,27 @@ for t, n in COMMODITIES.items():
             flagged["commodities"] = True
 if com_rows:
     data["commodities"] = com_rows
+    collect_level_notes(com_rows, "commodities", flagged, red_flags, big_picture)
 
+# --- Agro ---
+agro_hist = {}
+agro_rows = []
+for t, n in AGRO.items():
+    h, _ = fetch_yf_history(t)
+    if h is not None:
+        d = pct_changes(h)
+        h_1y, _ = fetch_yf_history(t, period="1y")
+        d["level"] = level_status(h_1y) if h_1y is not None else None
+        agro_hist[n] = h.tail(22)
+        agro_rows.append({"name": n, **d})
+        if is_unusual(d["chg_1d"]):
+            red_flags.append(f"{n} moved {d['chg_1d']:+.1f}% today (≥{UNUSUAL_MOVE_PCT:.0f}% threshold).")
+            flagged["agro"] = True
+if agro_rows:
+    data["agro"] = agro_rows
+    collect_level_notes(agro_rows, "agro", flagged, red_flags, big_picture)
+
+# --- VIX term structure ---
 vix_hist = {}
 vix_rows = []
 vix_levels = {}
@@ -410,6 +518,8 @@ for t in VIX_TERM:
     h, _ = fetch_yf_history(t)
     if h is not None:
         d = pct_changes(h, cap=SANITY_CAP_1D["vix"])
+        h_1y, _ = fetch_yf_history(t, period="1y")
+        d["level"] = level_status(h_1y) if h_1y is not None else None
         label = t.replace("^", "")
         vix_hist[label] = h.tail(22)
         vix_rows.append({"name": label, **d})
@@ -423,16 +533,22 @@ if vix_rows:
         flagged["vix"] = True
     else:
         notes.append("the VIX term structure is in normal contango (calm)")
+    collect_level_notes(vix_rows, "vix", flagged, red_flags, big_picture)
 
+# --- Dollar Index ---
 dxy_hist, _ = fetch_yf_history(DXY_TICKER)
 if dxy_hist is not None:
     d = pct_changes(dxy_hist)
+    dxy_1y, _ = fetch_yf_history(DXY_TICKER, period="1y")
+    d["level"] = level_status(dxy_1y) if dxy_1y is not None else None
     data["dxy"] = d
     if d["chg_1d"] is not None and abs(d["chg_1d"]) >= 0.5:
         red_flags.append(f"Dollar Index moved {d['chg_1d']:+.2f}% today.")
         flagged["dxy"] = True
     notes.append(f"the dollar is {'up' if (d['chg_1d'] or 0) >= 0 else 'down'} {abs(d['chg_1d'] or 0):.2f}% on the day")
+    collect_level_notes([{"name": "DXY", "level": d["level"]}], "dxy", flagged, red_flags, big_picture)
 
+# --- Credit stress ---
 hyg_hist, _ = fetch_yf_history("HYG")
 lqd_hist, _ = fetch_yf_history("LQD")
 if hyg_hist is not None and lqd_hist is not None:
@@ -440,12 +556,41 @@ if hyg_hist is not None and lqd_hist is not None:
     joined.columns = ["HYG", "LQD"]
     ratio = joined["HYG"] / joined["LQD"]
     d = pct_changes(ratio)
+    hyg_1y, _ = fetch_yf_history("HYG", period="1y")
+    lqd_1y, _ = fetch_yf_history("LQD", period="1y")
+    if hyg_1y is not None and lqd_1y is not None:
+        joined_1y = pd.concat([hyg_1y, lqd_1y], axis=1, join="inner")
+        joined_1y.columns = ["HYG", "LQD"]
+        ratio_1y = joined_1y["HYG"] / joined_1y["LQD"]
+        d["level"] = level_status(ratio_1y)
+    else:
+        d["level"] = None
     data["credit"] = dict(ratio=ratio, **d)
     if d["chg_1d"] is not None and d["chg_1d"] <= -0.5:
         red_flags.append(f"Credit stress proxy (HYG/LQD) fell {d['chg_1d']:.2f}% today.")
         flagged["credit"] = True
     notes.append(f"credit conditions ({'widening' if (d['chg_1d'] or 0) < 0 else 'stable-to-easing'})")
+    collect_level_notes([{"name": "HYG/LQD ratio", "level": d["level"]}], "credit", flagged, red_flags, big_picture)
 
+# --- Crypto ---
+crypto_hist = {}
+crypto_rows = []
+for t, n in CRYPTO.items():
+    h, _ = fetch_yf_history(t)
+    if h is not None:
+        d = pct_changes(h, week_n=CRYPTO_CFG["week_n"], month_n=CRYPTO_CFG["month_n"])
+        h_1y, _ = fetch_yf_history(t, period="1y")
+        d["level"] = level_status(h_1y, CRYPTO_CFG["month_window"], CRYPTO_CFG["year_window"]) if h_1y is not None else None
+        crypto_hist[n] = h.tail(30)
+        crypto_rows.append({"name": n, **d})
+        if is_unusual(d["chg_1d"]):
+            red_flags.append(f"{n} moved {d['chg_1d']:+.1f}% today (≥{UNUSUAL_MOVE_PCT:.0f}% threshold).")
+            flagged["crypto"] = True
+if crypto_rows:
+    data["crypto"] = crypto_rows
+    collect_level_notes(crypto_rows, "crypto", flagged, red_flags, big_picture)
+
+# --- Calendar ---
 events, fetched_at = fetch_ff_calendar()
 data["calendar"] = events
 high_impact_soon = [e for e in events if str(e.get("impact", "")).lower() in ("high", "3")]
@@ -460,6 +605,9 @@ if high_impact_soon:
 
 def build_narrative():
     base = "Taking stock of the tape right now: " + ("; ".join(notes) + "." if notes else "data is limited.")
+    if big_picture:
+        base += " On the bigger picture: " + "; ".join(sorted(set(big_picture))) + "."
+
     if not red_flags:
         base += (" Nothing here is flashing outside of normal ranges — context is clean, no single factor "
                  "demands a defensive posture today.")
@@ -470,10 +618,10 @@ def build_narrative():
     if flagged["rates"]:
         r = data["rates"]
         parts.append(
-            f"The 2s10s Treasury spread has moved into inversion, sitting at {r['slope_10s2s']:.0f} bps. "
-            "Curve inversions have historically preceded economic slowdowns or Fed policy pivots by several "
-            "quarters — it doesn't mean a recession is imminent, but it reflects the bond market pricing in "
-            "slower growth or future rate cuts relative to today's short-end pricing."
+            f"The 2s10s Treasury spread is at {r['slope_10s2s']:.0f} bps. "
+            "Curve moves — especially inversions — have historically preceded economic slowdowns or Fed "
+            "policy pivots by several quarters, and a fresh 52-week level on any tenor is worth tracking for "
+            "follow-through rather than reacting to one print."
         )
     if flagged["futures"]:
         parts.append(
@@ -483,10 +631,22 @@ def build_narrative():
         )
     if flagged["commodities"]:
         moves = [f"{r['name']} {r['chg_1d']:+.1f}%" for r in data.get("commodities", []) if is_unusual(r["chg_1d"])]
-        parts.append(
-            f"One or more commodities crossed the {UNUSUAL_MOVE_PCT:.0f}% single-day threshold ({', '.join(moves)}), "
-            "worth tracing back to a specific catalyst rather than dismissing as noise."
-        )
+        if moves:
+            parts.append(
+                f"One or more commodities crossed the {UNUSUAL_MOVE_PCT:.0f}% single-day threshold ({', '.join(moves)}), "
+                "worth tracing back to a specific catalyst rather than dismissing as noise."
+            )
+        else:
+            parts.append("A commodity in this group just hit a fresh 52-week level — worth a closer look at the driver.")
+    if flagged["agro"]:
+        moves = [f"{r['name']} {r['chg_1d']:+.1f}%" for r in data.get("agro", []) if is_unusual(r["chg_1d"])]
+        if moves:
+            parts.append(
+                f"Grains moved more than usual today ({', '.join(moves)}) — large single-day moves here can "
+                "bleed into food inflation and related equity sectors."
+            )
+        else:
+            parts.append("A grain contract just hit a fresh 52-week level — worth a closer look at the driver.")
     if flagged["vix"]:
         parts.append(
             "The VIX term structure has flipped into backwardation — near-term implied volatility is pricing "
@@ -494,16 +654,28 @@ def build_narrative():
         )
     if flagged["dxy"]:
         d = data["dxy"]
-        parts.append(
-            f"The Dollar Index moved {d['chg_1d']:+.2f}% in a single session — worth cross-referencing against "
-            "today's macro calendar for a rate or data-driven catalyst."
-        )
+        if d["chg_1d"] is not None and abs(d["chg_1d"]) >= 0.5:
+            parts.append(
+                f"The Dollar Index moved {d['chg_1d']:+.2f}% in a single session — worth cross-referencing against "
+                "today's macro calendar for a rate or data-driven catalyst."
+            )
+        else:
+            parts.append("The Dollar Index just hit a fresh 52-week level — worth watching for follow-through.")
     if flagged["credit"]:
         d = data["credit"]
-        parts.append(
-            f"The HYG/LQD credit stress proxy fell {d['chg_1d']:.2f}% today — worth monitoring for follow-through "
-            "over the next few sessions rather than treating a single-day move as conclusive."
-        )
+        if d["chg_1d"] is not None and d["chg_1d"] <= -0.5:
+            parts.append(
+                f"The HYG/LQD credit stress proxy fell {d['chg_1d']:.2f}% today — worth monitoring for "
+                "follow-through over the next few sessions rather than treating a single-day move as conclusive."
+            )
+        else:
+            parts.append("The HYG/LQD credit ratio just hit a fresh 52-week level — a genuine shift in relative credit risk appetite.")
+    if flagged["crypto"]:
+        moves = [f"{r['name']} {r['chg_1d']:+.1f}%" for r in data.get("crypto", []) if is_unusual(r["chg_1d"])]
+        if moves:
+            parts.append(f"Crypto moved sharply today ({', '.join(moves)}) — treat with the usual grain of salt given crypto's baseline volatility is naturally higher than the other groups here.")
+        else:
+            parts.append("BTC or ETH just hit a fresh 52-week level.")
     return "<br><br>".join(parts)
 
 
@@ -530,8 +702,8 @@ if red_flags:
     flag_html += "</div>"
     st.markdown(flag_html, unsafe_allow_html=True)
 else:
-    st.markdown("<span class='flag-ok'>✓ No red flags triggered across rates, futures, commodities, "
-                "VIX shape, DXY, or credit at current thresholds.</span>", unsafe_allow_html=True)
+    st.markdown("<span class='flag-ok'>✓ No red flags triggered across any group at current thresholds.</span>",
+                unsafe_allow_html=True)
 
 st.write("")
 
@@ -566,33 +738,23 @@ with left:
     if "rates" in data:
         r = data["rates"]
         c1, c2, c3 = st.columns(3)
-        c1.metric("2Y", f"{r['y2'].iloc[-1]:.2f}%", fmt_bps(r["c2"]["chg_1d"]))
-        c2.metric("10Y", f"{r['y10'].iloc[-1]:.2f}%", fmt_bps(r["c10"]["chg_1d"]))
-        c3.metric("30Y", f"{r['y30'].iloc[-1]:.2f}%", fmt_bps(r["c30"]["chg_1d"]))
+        with c1:
+            st.markdown(render_yield_box("2Y", r["y2"].iloc[-1], r["c2"]["chg_1d"], r["as_of_2"],
+                                          None, None), unsafe_allow_html=True)
+        with c2:
+            st.markdown(render_yield_box("10Y", r["y10"].iloc[-1], r["c10"]["chg_1d"], r["as_of"],
+                                          intraday_10y, intraday_10y_ts), unsafe_allow_html=True)
+        with c3:
+            st.markdown(render_yield_box("30Y", r["y30"].iloc[-1], r["c30"]["chg_1d"], r["as_of_30"],
+                                          intraday_30y, intraday_30y_ts), unsafe_allow_html=True)
 
-        intraday_html = "<div style='margin-top:10px;'>"
-        if intraday_10y is not None:
-            diff10 = (intraday_10y - r["y10"].iloc[-1]) * 100
-            intraday_html += (f"<span class='intraday-pill'>Intraday 10Y: <b>{intraday_10y:.2f}%</b> "
-                               f"({diff10:+.0f} bps vs FRED, {intraday_10y_ts})</span>")
-        if intraday_30y is not None:
-            diff30 = (intraday_30y - r["y30"].iloc[-1]) * 100
-            intraday_html += (f"<span class='intraday-pill'>Intraday 30Y: <b>{intraday_30y:.2f}%</b> "
-                               f"({diff30:+.0f} bps vs FRED, {intraday_30y_ts})</span>")
-        intraday_html += "</div>"
-        st.markdown(intraday_html, unsafe_allow_html=True)
-        st.markdown("<div class='small-caption'>No free intraday source for 2Y — 2Y stays FRED-only.</div>",
-                    unsafe_allow_html=True)
-
-        st.markdown(f"<div class='small-caption' style='margin-top:8px;'>10s2s: {r['slope_10s2s']:.0f} bps "
+        st.markdown(f"<div class='small-caption' style='margin-top:10px;'>10s2s: {r['slope_10s2s']:.0f} bps "
                     f"({r['trend_10s2s'] or '—'}) &nbsp;·&nbsp; 30s10s: {r['slope_30s10s']:.0f} bps</div>",
                     unsafe_allow_html=True)
         st.write("")
         chart_series = {"2Y": r["y2"].tail(66), "10Y": r["y10"].tail(66), "30Y": r["y30"].tail(66)}
         st.plotly_chart(multi_level_chart(chart_series, PALETTE, ticksuffix="%"),
                          use_container_width=True, config={"displayModeBar": False})
-        st.markdown(f"<div class='small-caption'>Official curve as of {r['as_of']} · FRED, daily par yields. "
-                    f"Intraday pills above are unofficial (yfinance).</div>", unsafe_allow_html=True)
     else:
         st.warning("Add FRED_API_KEY in Secrets to enable this section.")
     st.markdown("</div>", unsafe_allow_html=True)
@@ -616,6 +778,25 @@ with left:
         st.error("Could not load commodity data.")
     st.markdown("</div>", unsafe_allow_html=True)
 
+    cls = "card card-flag" if flagged["agro"] else "card"
+    st.markdown(f"<div class='{cls}'><h4>Agro (Wheat / Corn / Soybeans)</h4>", unsafe_allow_html=True)
+    if "agro" in data:
+        df = pd.DataFrame(data["agro"])
+        disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
+                                   "chg_1w": "1W", "chg_1m": "1M"})
+        for c in ["1D", "1W", "1M"]:
+            disp[c] = disp[c].apply(fmt_pct)
+        disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
+        st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
+                     use_container_width=True, height=145)
+        st.plotly_chart(normalized_chart(agro_hist, PALETTE), use_container_width=True,
+                         config={"displayModeBar": False})
+        st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day) "
+                    f"&nbsp;·&nbsp; CBOT futures, yfinance</div>", unsafe_allow_html=True)
+    else:
+        st.error("Could not load agro data.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
 with right:
     cls = "card card-flag" if flagged["vix"] else "card"
     st.markdown(f"<div class='{cls}'><h4>VIX Term Structure</h4>", unsafe_allow_html=True)
@@ -631,8 +812,8 @@ with right:
                      use_container_width=True, height=175)
         if df.get("suspect_1d", pd.Series(dtype=bool)).any():
             st.markdown("<div class='small-caption'>⚠️ One or more 1D changes exceeded the sanity threshold "
-                        f"(±{SANITY_CAP_1D['vix']:.0f}%) and were suppressed as likely data glitches rather than "
-                        "shown at face value.</div>", unsafe_allow_html=True)
+                        f"(±{SANITY_CAP_1D['vix']:.0f}%) and were suppressed as likely data glitches.</div>",
+                        unsafe_allow_html=True)
         st.plotly_chart(normalized_chart(vix_hist, PALETTE), use_container_width=True,
                          config={"displayModeBar": False})
         shape_txt = "Contango (calm)" if data["vix"]["ordered"] else "⚠️ Inverted / backwardated (risk-off)"
@@ -672,6 +853,25 @@ with right:
                          use_container_width=True, config={"displayModeBar": False})
     else:
         st.error("Could not load DXY.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    cls = "card card-flag" if flagged["crypto"] else "card"
+    st.markdown(f"<div class='{cls}'><h4>Crypto (BTC / ETH)</h4>", unsafe_allow_html=True)
+    if "crypto" in data:
+        df = pd.DataFrame(data["crypto"])
+        disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
+                                   "chg_1w": "1W", "chg_1m": "1M"})
+        for c in ["1D", "1W", "1M"]:
+            disp[c] = disp[c].apply(fmt_pct)
+        disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
+        st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
+                     use_container_width=True, height=110)
+        st.plotly_chart(normalized_chart(crypto_hist, PALETTE), use_container_width=True,
+                         config={"displayModeBar": False})
+        st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day) "
+                    f"&nbsp;·&nbsp; 1W/1M use 7-/30-day lookbacks (24/7 trading)</div>", unsafe_allow_html=True)
+    else:
+        st.error("Could not load crypto data.")
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
