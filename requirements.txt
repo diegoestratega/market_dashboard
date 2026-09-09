@@ -1,5 +1,8 @@
-streamlit
-yfinance
-pandas
-requests
-plotly
+# Pinned to the versions this app is tested against. Unpinned deps meant a
+# Streamlit Cloud rebuild could silently pull a release that drops a deprecated
+# API (e.g. use_container_width) and break the deployed app with no code change.
+streamlit>=1.63,<2
+yfinance>=1.7,<2
+pandas>=3.0,<4
+requests>=2.32,<3
+plotly>=7.0,<8

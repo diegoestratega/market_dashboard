@@ -1,23 +1,22 @@
 """
-Pre-Market / On-Demand Macro Context Dashboard (v6)
+Pre-Market / On-Demand Macro Context Dashboard
 ---------------------------------------------------------------------------
-New in this version:
-  - "Bigger picture" context in the narrative: flags 1-month highs/lows
-    (informational) and 52-week levels (informational if "near", escalated
-    to a red flag only on an actual breach) across every group.
-  - Two new groups: Agro (wheat/corn/soybeans) below Oil & Metals, and
-    Crypto (BTC/ETH) below Dollar Index. Crypto uses a 7-day/30-day
-    lookback instead of 5/21 since it trades 24/7, unlike everything else.
-  - Rates & Yield Curve boxes now show the FRED value + bps delta, the
-    "as of / delayed" notice, and the intraday reference value all inside
-    the same compact box (custom HTML in place of st.metric for this
-    section only — everything else still uses st.metric as before).
+Nine groups — rates & yield curve (FRED), index futures, oil & metals, agro,
+VIX term structure, dollar index, credit stress (HYG/LQD), crypto, and the
+macro calendar. Each reports 1D/1W/1M changes plus 1-month and 52-week level
+context, which feed the written "market read" and the red-flag list.
 
-Nothing else changed from the previous working version.
+Crypto uses 7-/30-day lookbacks rather than 5/21 because it trades 24/7.
+Yields come from FRED (daily, published with a lag); everything else comes
+from yfinance on a ~15-20 minute delay.
+
+Change history lives in git, not in this docstring.
 """
 
 import datetime as dt
+import os
 import time
+from contextlib import contextmanager
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -27,9 +26,23 @@ import yfinance as yf
 
 st.set_page_config(page_title="Macro Context Dashboard", layout="wide")
 
+
+def get_secret(name: str, default: str = ""):
+    """Read a secret without exploding when there is no secrets.toml.
+
+    st.secrets raises StreamlitSecretNotFoundError (it does not return the
+    default) whenever no secrets file exists, which is the normal case for a
+    local checkout — so fall back to the environment before giving up.
+    """
+    try:
+        return st.secrets.get(name, "") or os.environ.get(name, default)
+    except Exception:
+        return os.environ.get(name, default)
+
+
 UNUSUAL_MOVE_PCT = 3.0
 NEAR_52W_PCT = 1.0
-FRED_API_KEY = st.secrets.get("FRED_API_KEY", "")
+FRED_API_KEY = get_secret("FRED_API_KEY")
 
 FUTURES = {"ES=F": "S&P 500 (ES)", "NQ=F": "Nasdaq 100 (NQ)", "RTY=F": "Russell 2000 (RTY)"}
 FUTURES_FALLBACK = {"ES=F": ("^GSPC", "S&P 500 (cash, futures unavailable)"),
@@ -83,12 +96,17 @@ div[data-testid="stMetricValue"] {{
 }}
 div[data-testid="stMetricDelta"] svg {{ display: none; }}
 
-.card {{
-    background-color: {BG_CARD}; border-radius: 12px; padding: 20px 22px;
-    margin-bottom: 20px; border-left: 4px solid {ACCENT};
+/* Cards are real st.container() blocks keyed by card()/cardflag(), so the
+   styling lands on the element that actually contains the charts and tables.
+   The `st-key-card` prefix matches both the plain and flagged keys. */
+div[class*="st-key-card"] {{
+    background-color: {BG_CARD} !important;
+    border: none !important; border-left: 4px solid {ACCENT} !important;
+    border-radius: 12px !important; padding: 20px 22px !important;
+    margin-bottom: 20px;
 }}
-.card-flag {{ border-left: 4px solid {NEG}; }}
-.card h4 {{
+div[class*="st-key-cardflag-"] {{ border-left: 4px solid {NEG} !important; }}
+.card-title {{
     margin-top: 0; margin-bottom: 14px; font-size: 1.05rem; font-weight: 600;
     color: {TEXT}; letter-spacing: 0.2px;
 }}
@@ -117,6 +135,25 @@ div[data-testid="stMetricDelta"] svg {{ display: none; }}
 .yield-sub {{ font-size: 0.68rem; color: {MUTED}; margin-top: 6px; line-height: 1.4; }}
 </style>
 """, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Layout helpers
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def card(title: str, flagged: bool = False):
+    """A dashboard card that actually contains what follows it.
+
+    The previous version emitted a bare <div class='card'> through st.markdown
+    and closed it with a second st.markdown. Streamlit renders every element
+    into its own DOM subtree, so that div self-closed immediately and the card
+    never wrapped its charts or tables — only the title.
+    """
+    slug = "".join(ch if ch.isalnum() else "-" for ch in title.lower()).strip("-")
+    with st.container(border=True, key=f"{'cardflag' if flagged else 'card'}-{slug}"):
+        st.markdown(f"<h4 class='card-title'>{title}</h4>", unsafe_allow_html=True)
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +726,7 @@ with top_l:
     st.caption("On-demand snapshot — not a live stream · ~20 min delay tolerated on market data · daily on yields")
 with top_r:
     st.write("")
-    if st.button("🔄 Refresh", use_container_width=True):
+    if st.button("🔄 Refresh", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
@@ -714,185 +751,167 @@ st.write("")
 left, right = st.columns(2, gap="large")
 
 with left:
-    cls = "card card-flag" if flagged["futures"] else "card"
-    st.markdown(f"<div class='{cls}'><h4>Index Futures</h4>", unsafe_allow_html=True)
-    if "futures" in data:
-        df = pd.DataFrame(data["futures"]).sort_values("chg_1d", ascending=False)
-        disp = df.rename(columns={"name": "Future", "last": "Last", "chg_1d": "1D",
-                                   "chg_1w": "1W", "chg_1m": "1M"})
-        for c in ["1D", "1W", "1M"]:
-            disp[c] = disp[c].apply(fmt_pct)
-        disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(disp[["Future", "Last", "1D", "1W", "1M"]], hide_index=True,
-                     use_container_width=True, height=145)
-        st.plotly_chart(normalized_chart(fut_hist, PALETTE), use_container_width=True,
-                         config={"displayModeBar": False})
-        st.markdown(f"<div class='small-caption'>1D dispersion: {data.get('futures_dispersion', 0):.2f} pts "
-                    f"&nbsp;·&nbsp; yfinance, ~15-20 min delay</div>", unsafe_allow_html=True)
-    else:
-        st.error("Could not load futures data.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    with card("Index Futures", flagged["futures"]):
+        if "futures" in data:
+            df = pd.DataFrame(data["futures"]).sort_values("chg_1d", ascending=False)
+            disp = df.rename(columns={"name": "Future", "last": "Last", "chg_1d": "1D",
+                                       "chg_1w": "1W", "chg_1m": "1M"})
+            for c in ["1D", "1W", "1M"]:
+                disp[c] = disp[c].apply(fmt_pct)
+            disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
+            st.dataframe(disp[["Future", "Last", "1D", "1W", "1M"]], hide_index=True,
+                         width="stretch", height=145)
+            st.plotly_chart(normalized_chart(fut_hist, PALETTE), width="stretch",
+                             config={"displayModeBar": False})
+            st.markdown(f"<div class='small-caption'>1D dispersion: {data.get('futures_dispersion', 0):.2f} pts "
+                        f"&nbsp;·&nbsp; yfinance, ~15-20 min delay</div>", unsafe_allow_html=True)
+        else:
+            st.error("Could not load futures data.")
 
-    cls = "card card-flag" if flagged["rates"] else "card"
-    st.markdown(f"<div class='{cls}'><h4>Rates & Yield Curve</h4>", unsafe_allow_html=True)
-    if "rates" in data:
-        r = data["rates"]
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown(render_yield_box("2Y", r["y2"].iloc[-1], r["c2"]["chg_1d"], r["as_of_2"],
-                                          None, None), unsafe_allow_html=True)
-        with c2:
-            st.markdown(render_yield_box("10Y", r["y10"].iloc[-1], r["c10"]["chg_1d"], r["as_of"],
-                                          intraday_10y, intraday_10y_ts), unsafe_allow_html=True)
-        with c3:
-            st.markdown(render_yield_box("30Y", r["y30"].iloc[-1], r["c30"]["chg_1d"], r["as_of_30"],
-                                          intraday_30y, intraday_30y_ts), unsafe_allow_html=True)
+    with card("Rates & Yield Curve", flagged["rates"]):
+        if "rates" in data:
+            r = data["rates"]
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown(render_yield_box("2Y", r["y2"].iloc[-1], r["c2"]["chg_1d"], r["as_of_2"],
+                                              None, None), unsafe_allow_html=True)
+            with c2:
+                st.markdown(render_yield_box("10Y", r["y10"].iloc[-1], r["c10"]["chg_1d"], r["as_of"],
+                                              intraday_10y, intraday_10y_ts), unsafe_allow_html=True)
+            with c3:
+                st.markdown(render_yield_box("30Y", r["y30"].iloc[-1], r["c30"]["chg_1d"], r["as_of_30"],
+                                              intraday_30y, intraday_30y_ts), unsafe_allow_html=True)
 
-        st.markdown(f"<div class='small-caption' style='margin-top:10px;'>10s2s: {r['slope_10s2s']:.0f} bps "
-                    f"({r['trend_10s2s'] or '—'}) &nbsp;·&nbsp; 30s10s: {r['slope_30s10s']:.0f} bps</div>",
-                    unsafe_allow_html=True)
-        st.write("")
-        chart_series = {"2Y": r["y2"].tail(66), "10Y": r["y10"].tail(66), "30Y": r["y30"].tail(66)}
-        st.plotly_chart(multi_level_chart(chart_series, PALETTE, ticksuffix="%"),
-                         use_container_width=True, config={"displayModeBar": False})
-    else:
-        st.warning("Add FRED_API_KEY in Secrets to enable this section.")
-    st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='small-caption' style='margin-top:10px;'>10s2s: {r['slope_10s2s']:.0f} bps "
+                        f"({r['trend_10s2s'] or '—'}) &nbsp;·&nbsp; 30s10s: {r['slope_30s10s']:.0f} bps</div>",
+                        unsafe_allow_html=True)
+            st.write("")
+            chart_series = {"2Y": r["y2"].tail(66), "10Y": r["y10"].tail(66), "30Y": r["y30"].tail(66)}
+            st.plotly_chart(multi_level_chart(chart_series, PALETTE, ticksuffix="%"),
+                             width="stretch", config={"displayModeBar": False})
+        else:
+            st.warning("Add FRED_API_KEY in Secrets to enable this section.")
 
-    cls = "card card-flag" if flagged["commodities"] else "card"
-    st.markdown(f"<div class='{cls}'><h4>Oil & Metals</h4>", unsafe_allow_html=True)
-    if "commodities" in data:
-        df = pd.DataFrame(data["commodities"])
-        disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
-                                   "chg_1w": "1W", "chg_1m": "1M"})
-        for c in ["1D", "1W", "1M"]:
-            disp[c] = disp[c].apply(fmt_pct)
-        disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
-                     use_container_width=True, height=175)
-        st.plotly_chart(normalized_chart(com_hist, PALETTE), use_container_width=True,
-                         config={"displayModeBar": False})
-        st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day)</div>",
-                    unsafe_allow_html=True)
-    else:
-        st.error("Could not load commodity data.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    with card("Oil & Metals", flagged["commodities"]):
+        if "commodities" in data:
+            df = pd.DataFrame(data["commodities"])
+            disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
+                                       "chg_1w": "1W", "chg_1m": "1M"})
+            for c in ["1D", "1W", "1M"]:
+                disp[c] = disp[c].apply(fmt_pct)
+            disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
+            st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
+                         width="stretch", height=175)
+            st.plotly_chart(normalized_chart(com_hist, PALETTE), width="stretch",
+                             config={"displayModeBar": False})
+            st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day)</div>",
+                        unsafe_allow_html=True)
+        else:
+            st.error("Could not load commodity data.")
 
-    cls = "card card-flag" if flagged["agro"] else "card"
-    st.markdown(f"<div class='{cls}'><h4>Agro (Wheat / Corn / Soybeans)</h4>", unsafe_allow_html=True)
-    if "agro" in data:
-        df = pd.DataFrame(data["agro"])
-        disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
-                                   "chg_1w": "1W", "chg_1m": "1M"})
-        for c in ["1D", "1W", "1M"]:
-            disp[c] = disp[c].apply(fmt_pct)
-        disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
-                     use_container_width=True, height=145)
-        st.plotly_chart(normalized_chart(agro_hist, PALETTE), use_container_width=True,
-                         config={"displayModeBar": False})
-        st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day) "
-                    f"&nbsp;·&nbsp; CBOT futures, yfinance</div>", unsafe_allow_html=True)
-    else:
-        st.error("Could not load agro data.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    with card("Agro (Wheat / Corn / Soybeans)", flagged["agro"]):
+        if "agro" in data:
+            df = pd.DataFrame(data["agro"])
+            disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
+                                       "chg_1w": "1W", "chg_1m": "1M"})
+            for c in ["1D", "1W", "1M"]:
+                disp[c] = disp[c].apply(fmt_pct)
+            disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
+            st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
+                         width="stretch", height=145)
+            st.plotly_chart(normalized_chart(agro_hist, PALETTE), width="stretch",
+                             config={"displayModeBar": False})
+            st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day) "
+                        f"&nbsp;·&nbsp; CBOT futures, yfinance</div>", unsafe_allow_html=True)
+        else:
+            st.error("Could not load agro data.")
 
 with right:
-    cls = "card card-flag" if flagged["vix"] else "card"
-    st.markdown(f"<div class='{cls}'><h4>VIX Term Structure</h4>", unsafe_allow_html=True)
-    if "vix" in data:
-        df = pd.DataFrame(data["vix"]["rows"])
-        disp = df.rename(columns={"name": "Index", "last": "Last", "chg_1d": "1D",
-                                   "chg_1w": "1W", "chg_1m": "1M"})
-        disp["1D"] = df.apply(lambda row: fmt_pct(row["chg_1d"], row.get("suspect_1d", False)), axis=1)
-        disp["1W"] = df["chg_1w"].apply(fmt_pct)
-        disp["1M"] = df["chg_1m"].apply(fmt_pct)
-        disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(disp[["Index", "Last", "1D", "1W", "1M"]], hide_index=True,
-                     use_container_width=True, height=175)
-        if df.get("suspect_1d", pd.Series(dtype=bool)).any():
-            st.markdown("<div class='small-caption'>⚠️ One or more 1D changes exceeded the sanity threshold "
-                        f"(±{SANITY_CAP_1D['vix']:.0f}%) and were suppressed as likely data glitches.</div>",
-                        unsafe_allow_html=True)
-        st.plotly_chart(normalized_chart(vix_hist, PALETTE), use_container_width=True,
-                         config={"displayModeBar": False})
-        shape_txt = "Contango (calm)" if data["vix"]["ordered"] else "⚠️ Inverted / backwardated (risk-off)"
-        st.markdown(f"<div class='small-caption'>Shape: {shape_txt}</div>", unsafe_allow_html=True)
-    else:
-        st.error("Could not load VIX data.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    with card("VIX Term Structure", flagged["vix"]):
+        if "vix" in data:
+            df = pd.DataFrame(data["vix"]["rows"])
+            disp = df.rename(columns={"name": "Index", "last": "Last", "chg_1d": "1D",
+                                       "chg_1w": "1W", "chg_1m": "1M"})
+            disp["1D"] = df.apply(lambda row: fmt_pct(row["chg_1d"], row.get("suspect_1d", False)), axis=1)
+            disp["1W"] = df["chg_1w"].apply(fmt_pct)
+            disp["1M"] = df["chg_1m"].apply(fmt_pct)
+            disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
+            st.dataframe(disp[["Index", "Last", "1D", "1W", "1M"]], hide_index=True,
+                         width="stretch", height=175)
+            if df.get("suspect_1d", pd.Series(dtype=bool)).any():
+                st.markdown("<div class='small-caption'>⚠️ One or more 1D changes exceeded the sanity threshold "
+                            f"(±{SANITY_CAP_1D['vix']:.0f}%) and were suppressed as likely data glitches.</div>",
+                            unsafe_allow_html=True)
+            st.plotly_chart(normalized_chart(vix_hist, PALETTE), width="stretch",
+                             config={"displayModeBar": False})
+            shape_txt = "Contango (calm)" if data["vix"]["ordered"] else "⚠️ Inverted / backwardated (risk-off)"
+            st.markdown(f"<div class='small-caption'>Shape: {shape_txt}</div>", unsafe_allow_html=True)
+        else:
+            st.error("Could not load VIX data.")
 
-    cls = "card card-flag" if flagged["credit"] else "card"
-    st.markdown(f"<div class='{cls}'><h4>Credit Stress (HYG / LQD)</h4>", unsafe_allow_html=True)
-    if "credit" in data:
-        d = data["credit"]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Ratio", f"{d['last']:.3f}", fmt_pct(d["chg_1d"]))
-        c2.metric("1W", fmt_pct(d["chg_1w"]))
-        c3.metric("1M", fmt_pct(d["chg_1m"]))
-        st.write("")
-        st.plotly_chart(level_chart(d["ratio"].tail(22), color=ACCENT3),
-                         use_container_width=True, config={"displayModeBar": False})
-        note = "Ratio falling → high-yield underperforming IG → credit stress widening." if (d["chg_1d"] or 0) < 0 \
-            else "Ratio rising → high-yield outperforming IG → credit conditions easing."
-        st.markdown(f"<div class='small-caption'>{note}</div>", unsafe_allow_html=True)
-    else:
-        st.error("Could not load credit data.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    with card("Credit Stress (HYG / LQD)", flagged["credit"]):
+        if "credit" in data:
+            d = data["credit"]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Ratio", f"{d['last']:.3f}", fmt_pct(d["chg_1d"]))
+            c2.metric("1W", fmt_pct(d["chg_1w"]))
+            c3.metric("1M", fmt_pct(d["chg_1m"]))
+            st.write("")
+            st.plotly_chart(level_chart(d["ratio"].tail(22), color=ACCENT3),
+                             width="stretch", config={"displayModeBar": False})
+            note = "Ratio falling → high-yield underperforming IG → credit stress widening." if (d["chg_1d"] or 0) < 0 \
+                else "Ratio rising → high-yield outperforming IG → credit conditions easing."
+            st.markdown(f"<div class='small-caption'>{note}</div>", unsafe_allow_html=True)
+        else:
+            st.error("Could not load credit data.")
 
-    cls = "card card-flag" if flagged["dxy"] else "card"
-    st.markdown(f"<div class='{cls}'><h4>Dollar Index (DXY)</h4>", unsafe_allow_html=True)
-    if "dxy" in data:
-        d = data["dxy"]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("DXY", f"{d['last']:.2f}", fmt_pct(d["chg_1d"]))
-        c2.metric("1W", fmt_pct(d["chg_1w"]))
-        c3.metric("1M", fmt_pct(d["chg_1m"]))
-        st.write("")
-        st.plotly_chart(level_chart(dxy_hist.tail(22), color=ACCENT2),
-                         use_container_width=True, config={"displayModeBar": False})
-    else:
-        st.error("Could not load DXY.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    with card("Dollar Index (DXY)", flagged["dxy"]):
+        if "dxy" in data:
+            d = data["dxy"]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("DXY", f"{d['last']:.2f}", fmt_pct(d["chg_1d"]))
+            c2.metric("1W", fmt_pct(d["chg_1w"]))
+            c3.metric("1M", fmt_pct(d["chg_1m"]))
+            st.write("")
+            st.plotly_chart(level_chart(dxy_hist.tail(22), color=ACCENT2),
+                             width="stretch", config={"displayModeBar": False})
+        else:
+            st.error("Could not load DXY.")
 
-    cls = "card card-flag" if flagged["crypto"] else "card"
-    st.markdown(f"<div class='{cls}'><h4>Crypto (BTC / ETH)</h4>", unsafe_allow_html=True)
-    if "crypto" in data:
-        df = pd.DataFrame(data["crypto"])
-        disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
-                                   "chg_1w": "1W", "chg_1m": "1M"})
-        for c in ["1D", "1W", "1M"]:
-            disp[c] = disp[c].apply(fmt_pct)
-        disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
-                     use_container_width=True, height=110)
-        st.plotly_chart(normalized_chart(crypto_hist, PALETTE), use_container_width=True,
-                         config={"displayModeBar": False})
-        st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day) "
-                    f"&nbsp;·&nbsp; 1W/1M use 7-/30-day lookbacks (24/7 trading)</div>", unsafe_allow_html=True)
-    else:
-        st.error("Could not load crypto data.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    with card("Crypto (BTC / ETH)", flagged["crypto"]):
+        if "crypto" in data:
+            df = pd.DataFrame(data["crypto"])
+            disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
+                                       "chg_1w": "1W", "chg_1m": "1M"})
+            for c in ["1D", "1W", "1M"]:
+                disp[c] = disp[c].apply(fmt_pct)
+            disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
+            st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
+                         width="stretch", height=110)
+            st.plotly_chart(normalized_chart(crypto_hist, PALETTE), width="stretch",
+                             config={"displayModeBar": False})
+            st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day) "
+                        f"&nbsp;·&nbsp; 1W/1M use 7-/30-day lookbacks (24/7 trading)</div>", unsafe_allow_html=True)
+        else:
+            st.error("Could not load crypto data.")
 
 # ---------------------------------------------------------------------------
 # Full-width Macro Calendar
 # ---------------------------------------------------------------------------
 
 st.write("")
-st.markdown("<div class='card'><h4>Macro Calendar — CPI / NFP / FOMC / PCE (USD, this week)</h4>",
-            unsafe_allow_html=True)
-if data.get("calendar"):
-    rows = []
-    for e in data["calendar"]:
-        rows.append({
-            "When": format_event_datetime(e.get("date", "")),
-            "Event": e.get("title", ""),
-            "Impact": str(e.get("impact", "")),
-        })
-    cal_df = pd.DataFrame(rows)
-    st.dataframe(cal_df, hide_index=True, use_container_width=True, height=190)
-else:
-    st.info("No matching USD events this week, or the calendar feed is unavailable.")
-st.markdown(f"<div class='small-caption'>Fetched {fetched_at} · ForexFactory public calendar feed, cached ~6h</div>",
-            unsafe_allow_html=True)
-st.markdown("</div>", unsafe_allow_html=True)
+with card("Macro Calendar — CPI / NFP / FOMC / PCE (USD, this week)"):
+    if data.get("calendar"):
+        rows = []
+        for e in data["calendar"]:
+            rows.append({
+                "When": format_event_datetime(e.get("date", "")),
+                "Event": e.get("title", ""),
+                "Impact": str(e.get("impact", "")),
+            })
+        cal_df = pd.DataFrame(rows)
+        st.dataframe(cal_df, hide_index=True, width="stretch", height=190)
+    else:
+        st.info("No matching USD events this week, or the calendar feed is unavailable.")
+    st.markdown(f"<div class='small-caption'>Fetched {fetched_at} · ForexFactory public calendar feed, cached ~6h</div>",
+                unsafe_allow_html=True)
