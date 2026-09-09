@@ -80,6 +80,17 @@ CRYPTO = {"BTC-USD": "Bitcoin (BTC)", "ETH-USD": "Ethereum (ETH)"}
 VIX_TERM = ["^VIX9D", "^VIX", "^VIX3M", "^VIX6M"]
 DXY_TICKER = "DX-Y.NYB"
 
+# Changes at or inside this band read as noise and are greyed rather than
+# coloured, so a -0.02% tick does not look like a meaningful down day.
+NOISE_PCT = 0.05
+
+# Quarterly roll for equity index futures: third Friday of these months. A gap
+# only counts as a roll if it also diverges from the cash index by more than
+# ROLL_DIVERGENCE_PP, so a genuine overnight move is never mistaken for one.
+ROLL_MONTHS = (3, 6, 9, 12)
+ROLL_WINDOW_DAYS = 4
+ROLL_DIVERGENCE_PP = 0.75
+
 # Live yield proxies. Yahoo publishes intraday indices for the 5Y, 10Y and 30Y
 # but has nothing for the 2Y: ^UST2Y/^US2Y do not exist, and 2YY=F (CBOT 2-Year
 # Yield futures) is too thinly quoted to use — one 15-minute bar in five days,
@@ -355,6 +366,52 @@ def bps_changes(series: pd.Series):
             "sigma": sd if sd else None}
 
 
+def _third_friday(year, month):
+    d = dt.date(year, month, 15)
+    while d.weekday() != 4:
+        d += dt.timedelta(days=1)
+    return d
+
+
+def in_roll_window(ts):
+    """Equity index futures roll on the third Friday of Mar/Jun/Sep/Dec."""
+    d = ts.date()
+    for m in ROLL_MONTHS:
+        tf = _third_friday(d.year, m)
+        if 0 <= (d - tf).days <= ROLL_WINDOW_DAYS:
+            return True
+    return False
+
+
+def backadjust_rolls(fut: pd.Series, cash: pd.Series):
+    """Strip quarterly roll discontinuities out of a continuous futures series.
+
+    Yahoo's `=F` series switches to the next contract without back-adjusting,
+    so the calendar spread lands as a one-day price jump. Measured against the
+    cash index those gaps reached 3.2 percentage points — a 3-sigma phantom
+    move that trips the flagging system, inflates sigma, and leaves the
+    52-week range describing prices that were never traded on one contract.
+
+    On a roll day the contract's economic return is the cash index's return,
+    so substitute it there and rebuild the series so it still ends on the true
+    current price.
+    """
+    if fut is None or cash is None or fut.empty or cash.empty:
+        return fut, 0
+    j = pd.concat([fut.rename("f"), cash.rename("c")], axis=1, join="inner").dropna()
+    if len(j) < 30:
+        return fut, 0
+    rf, rc = j["f"].pct_change(), j["c"].pct_change()
+    rolls = ((rf - rc).abs() * 100 > ROLL_DIVERGENCE_PP) & \
+            pd.Series([in_roll_window(t) for t in j.index], index=j.index)
+    if not rolls.any():
+        return fut, 0
+    adj = rf.where(~rolls, rc).fillna(0)
+    growth = (1 + adj).cumprod()
+    rebuilt = growth / growth.iloc[-1] * float(j["f"].iloc[-1])
+    return rebuilt, int(rolls.sum())
+
+
 def estimate_live_2y(fred_2y, fvx_daily, fvx_live):
     """FRED's settled 2Y carried forward by the 5Y's move since that settle.
 
@@ -582,6 +639,39 @@ def multi_level_chart(series_dict: dict, colors, height=CHART_HEIGHT, ticksuffix
     return base_layout(fig, height, legend=True, y_range=y_range)
 
 
+def change_colour(v):
+    """Grey inside the noise band, otherwise green or red."""
+    if v is None or (isinstance(v, float) and pd.isna(v)) or abs(v) <= NOISE_PCT:
+        return MUTED
+    return POS if v > 0 else NEG
+
+
+def render_change_table(rows, name_header, last_fmt="{:,.2f}", height=145,
+                        change_cols=("chg_1d", "chg_1w", "chg_1m"),
+                        headers=("1D", "1W", "1M"), sort_by=None):
+    """One styled table for every group, so changes are encoded the same way
+    everywhere: coloured by direction, greyed when inside the noise band."""
+    df = pd.DataFrame(rows)
+    if sort_by and sort_by in df.columns:
+        df = df.sort_values(sort_by, ascending=False)
+    df = df.reset_index(drop=True)
+    out = pd.DataFrame({name_header: df["name"],
+                        "Last": df["last"].map(lambda v: last_fmt.format(v) if v is not None else "—")})
+    for col, hdr in zip(change_cols, headers):
+        if "suspect_1d" in df.columns and col == "chg_1d":
+            out[hdr] = [fmt_pct(v, bool(s)) for v, s in zip(df[col], df["suspect_1d"])]
+        else:
+            out[hdr] = df[col].map(fmt_pct)
+
+    def paint(col):
+        src = df[change_cols[list(headers).index(col.name)]]
+        return [f"color: {change_colour(v)}" for v in src]
+
+    styled = out.style.apply(paint, subset=list(headers), axis=0) \
+                      .hide(axis="index")
+    st.dataframe(styled, width="stretch", height=height, hide_index=True)
+
+
 def render_change_box(label, chg_pct):
     """One period's change, coloured. Used for 1D/1W/1M alike.
 
@@ -592,8 +682,8 @@ def render_change_box(label, chg_pct):
     if chg_pct is None:
         body = f"<div class='yield-value' style='color:{MUTED}'>—</div>"
     else:
-        colour = POS if chg_pct >= 0 else NEG
-        body = f"<div class='yield-value' style='color:{colour}'>{chg_pct:+.2f}%</div>"
+        body = (f"<div class='yield-value' style='color:{change_colour(chg_pct)}'>"
+                f"{chg_pct:+.2f}%</div>")
     return (f"<div class='yield-box' style='min-height:70px'>"
             f"<div class='yield-label'>{label}</div>{body}</div>")
 
@@ -737,9 +827,17 @@ live_yield["2Y"] = {
 # --- Index futures ---
 fut_hist = {}
 fut_rows = []
+rolls_removed = 0
 for t, n in FUTURES.items():
     h, label, used_ticker = fetch_future_with_fallback(t, n)
     if h is not None:
+        # Only the futures contracts carry roll gaps; if we already fell back
+        # to the cash index there is nothing to adjust.
+        if used_ticker.endswith("=F"):
+            cash_tk = FUTURES_FALLBACK.get(t, (None, None))[0]
+            cash_h, _ = fetch_yf_history(cash_tk) if cash_tk else (None, None)
+            h, n_rolls = backadjust_rolls(h, cash_h)
+            rolls_removed += n_rolls
         d = pct_changes(h, **{k: v for k, v in STANDARD_CFG.items() if k in ("week_n", "month_n")})
         d["level"] = level_status(h, STANDARD_CFG["month_window"], STANDARD_CFG["year_window"])
         fut_hist[label] = h.tail(22)
@@ -1045,14 +1143,7 @@ left, right = st.columns(2, gap="large")
 with left:
     with card("Index Futures", flagged["futures"]):
         if "futures" in data:
-            df = pd.DataFrame(data["futures"]).sort_values("chg_1d", ascending=False)
-            disp = df.rename(columns={"name": "Future", "last": "Last", "chg_1d": "1D",
-                                       "chg_1w": "1W", "chg_1m": "1M"})
-            for c in ["1D", "1W", "1M"]:
-                disp[c] = disp[c].apply(fmt_pct)
-            disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-            st.dataframe(disp[["Future", "Last", "1D", "1W", "1M"]], hide_index=True,
-                         width="stretch", height=145)
+            render_change_table(data["futures"], "Future", height=145, sort_by="chg_1d")
             st.plotly_chart(normalized_chart(fut_hist, PALETTE), width="stretch",
                              config={"displayModeBar": False})
             st.markdown(f"<div class='small-caption'>1D dispersion: {data.get('futures_dispersion', 0):.2f} pp "
@@ -1106,14 +1197,7 @@ with left:
 
     with card("Oil & Metals", flagged["commodities"]):
         if "commodities" in data:
-            df = pd.DataFrame(data["commodities"])
-            disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
-                                       "chg_1w": "1W", "chg_1m": "1M"})
-            for c in ["1D", "1W", "1M"]:
-                disp[c] = disp[c].apply(fmt_pct)
-            disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-            st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
-                         width="stretch", height=175)
+            render_change_table(data["commodities"], "Asset", height=175)
             st.plotly_chart(normalized_chart(com_hist, PALETTE), width="stretch",
                              config={"displayModeBar": False})
             st.markdown(f"<div class='small-caption'>Unusual move: ≥{UNUSUAL_MOVE_SIGMA:.1f}σ of this series' own daily vol, or ≥±{UNUSUAL_MOVE_PCT:.0f}% outright</div>",
@@ -1123,14 +1207,7 @@ with left:
 
     with card("Agro (Wheat / Corn / Soybeans)", flagged["agro"]):
         if "agro" in data:
-            df = pd.DataFrame(data["agro"])
-            disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
-                                       "chg_1w": "1W", "chg_1m": "1M"})
-            for c in ["1D", "1W", "1M"]:
-                disp[c] = disp[c].apply(fmt_pct)
-            disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-            st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
-                         width="stretch", height=145)
+            render_change_table(data["agro"], "Asset", height=145)
             st.plotly_chart(normalized_chart(agro_hist, PALETTE), width="stretch",
                              config={"displayModeBar": False})
             st.markdown(f"<div class='small-caption'>Unusual move: ≥{UNUSUAL_MOVE_SIGMA:.1f}σ of this series' own daily vol, or ≥±{UNUSUAL_MOVE_PCT:.0f}% outright "
@@ -1142,14 +1219,7 @@ with right:
     with card("VIX Term Structure", flagged["vix"]):
         if "vix" in data:
             df = pd.DataFrame(data["vix"]["rows"])
-            disp = df.rename(columns={"name": "Index", "last": "Last", "chg_1d": "1D",
-                                       "chg_1w": "1W", "chg_1m": "1M"})
-            disp["1D"] = df.apply(lambda row: fmt_pct(row["chg_1d"], row.get("suspect_1d", False)), axis=1)
-            disp["1W"] = df["chg_1w"].apply(fmt_pct)
-            disp["1M"] = df["chg_1m"].apply(fmt_pct)
-            disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-            st.dataframe(disp[["Index", "Last", "1D", "1W", "1M"]], hide_index=True,
-                         width="stretch", height=175)
+            render_change_table(data["vix"]["rows"], "Index", height=175)
             if df.get("suspect_1d", pd.Series(dtype=bool)).any():
                 st.markdown("<div class='small-caption'>⚠️ One or more 1D changes exceeded the sanity threshold "
                             f"(±{SANITY_CAP_1D['vix']:.0f}%) and were suppressed as likely data glitches.</div>",
@@ -1198,14 +1268,7 @@ with right:
 
     with card("Crypto (BTC / ETH)", flagged["crypto"]):
         if "crypto" in data:
-            df = pd.DataFrame(data["crypto"])
-            disp = df.rename(columns={"name": "Asset", "last": "Last", "chg_1d": "1D",
-                                       "chg_1w": "1W", "chg_1m": "1M"})
-            for c in ["1D", "1W", "1M"]:
-                disp[c] = disp[c].apply(fmt_pct)
-            disp["Last"] = disp["Last"].apply(lambda x: f"{x:,.2f}")
-            st.dataframe(disp[["Asset", "Last", "1D", "1W", "1M"]], hide_index=True,
-                         width="stretch", height=110)
+            render_change_table(data["crypto"], "Asset", height=110)
             st.plotly_chart(normalized_chart(crypto_hist, PALETTE), width="stretch",
                              config={"displayModeBar": False})
             st.markdown(f"<div class='small-caption'>Unusual move: ≥{UNUSUAL_MOVE_SIGMA:.1f}σ of this series' own daily vol, or ≥±{UNUSUAL_MOVE_PCT:.0f}% outright "

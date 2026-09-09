@@ -49,6 +49,14 @@ and a coin that moves 65%.
 - **Credit ratio uses raw, not dividend-adjusted, prices.** HYG yields ~6.1% and
   LQD ~4.7%, so adjusted history drifts the ratio upward by the carry
   differential rather than by credit conditions.
+- **Index futures are roll-adjusted.** Yahoo's `=F` series switches contract
+  without back-adjusting, so the calendar spread lands as a one-day price jump —
+  measured against the cash index these reached 3.2 percentage points, a 3σ
+  phantom move. On a roll day (third Friday of Mar/Jun/Sep/Dec) the contract's
+  economic return is the cash index's return, so it is substituted and the
+  series rebuilt to end on the true current price.
+- **Noise band** — changes at or inside ±0.05% are greyed rather than coloured,
+  so a −0.02% tick does not read as a meaningful down day.
 - **Stale data** — any series whose newest bar lags the rest of the board by a
   session is called out, so old figures are never presented as today's.
 
