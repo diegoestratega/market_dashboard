@@ -64,6 +64,10 @@ and a coin that moves 65%.
   current. This is not hypothetical: Yahoo stopped publishing `^VIX9D`,
   `^VIX3M` and `^VIX6M` for 54 days in 2026 while continuing to report a
   current level, so their "1-day" change was really a 54-day change.
+- **Which session** — the header states the session the change columns refer
+  to. Before the open there is no bar for the current day, so "1D" is the
+  previous session's move; the header says so instead of leaving it implicit,
+  and the narrative names the session rather than asserting "today".
 - **Stale data** — any series whose newest bar lags the rest of the board by a
   session is called out, so old figures are never presented as today's.
 

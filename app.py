@@ -522,14 +522,20 @@ def level_status(series: pd.Series, month_window: int = 21, year_window: int = 2
     return result
 
 
+def _missing(x):
+    """None survives a plain dict, but pandas turns it into NaN inside a float
+    column — and NaN is not None, so a withheld figure printed as "+nan%"."""
+    return x is None or (isinstance(x, float) and pd.isna(x))
+
+
 def fmt_pct(x, suspect=False):
     if suspect:
         return "⚠️ check"
-    return "—" if x is None else f"{x:+.2f}%"
+    return "—" if _missing(x) else f"{x:+.2f}%"
 
 
 def fmt_bps(x):
-    return "—" if x is None else f"{x:+.0f} bps"
+    return "—" if _missing(x) else f"{x:+.0f} bps"
 
 
 def is_unusual(chg_1d_pct, sigma=None):
@@ -547,11 +553,29 @@ def is_unusual(chg_1d_pct, sigma=None):
     return z is not None and z >= UNUSUAL_MOVE_SIGMA
 
 
-def move_phrase(name, chg_pct, sigma):
+def market_today():
+    """Today's date in US market time."""
+    return pd.Timestamp.now(tz=MARKET_TZ).normalize().tz_localize(None)
+
+
+def session_word(session_date):
+    """"today" only when the newest bar really is today's session.
+
+    Before the open there is no bar for the current day, so a "1-day" change is
+    the previous session's — which the dashboard used to narrate as "today"
+    regardless. Naming the session instead of asserting "today" is also correct
+    on weekends and holidays, and needs no trading calendar.
+    """
+    if session_date is None:
+        return "in the latest session"
+    return "today" if session_date >= market_today() else f"on {session_date:%b %d}"
+
+
+def move_phrase(name, chg_pct, sigma, when="today"):
     """'Corn moved +3.4% today (2.1σ)' — the sigma makes the size legible."""
     z = z_score(chg_pct, sigma)
     tail = f" ({z:.1f}σ)" if z is not None else ""
-    return f"{name} moved {chg_pct:+.1f}% today{tail}."
+    return f"{name} moved {chg_pct:+.1f}% {when}{tail}."
 
 
 def format_market_time(ts):
@@ -667,7 +691,7 @@ def multi_level_chart(series_dict: dict, colors, height=CHART_HEIGHT, ticksuffix
 
 def change_colour(v):
     """Grey inside the noise band, otherwise green or red."""
-    if v is None or (isinstance(v, float) and pd.isna(v)) or abs(v) <= NOISE_PCT:
+    if _missing(v) or abs(v) <= NOISE_PCT:
         return MUTED
     return POS if v > 0 else NEG
 
@@ -697,10 +721,10 @@ def render_change_table(rows, name_header, last_fmt="{:,.2f}", height=145,
                       .hide(axis="index")
     st.dataframe(styled, width="stretch", height=height, hide_index=True)
     if "gapped" in df.columns and df["gapped"].any():
-        missing = ", ".join(df.loc[df["gapped"], "name"])
-        st.markdown(f"<div class='small-caption'>— for {missing}: the source series is "
-                    f"missing sessions, so a change over that window would not mean what "
-                    f"the column says. The level is current.</div>", unsafe_allow_html=True)
+        shown = ", ".join(df.loc[~df["gapped"], "name"]) or "none"
+        st.markdown(f"<div class='small-caption'>Levels are current for all. Changes shown "
+                    f"for {shown} only — the rest are missing sessions upstream.</div>",
+                    unsafe_allow_html=True)
 
 
 def render_change_box(label, chg_pct):
@@ -710,7 +734,7 @@ def render_change_box(label, chg_pct):
     as a small coloured st.metric delta, 1W and 1M as large plain values, so
     the same quantity looked like different kinds of thing.
     """
-    if chg_pct is None:
+    if _missing(chg_pct):
         body = f"<div class='yield-value' style='color:{MUTED}'>—</div>"
     else:
         body = (f"<div class='yield-value' style='color:{change_colour(chg_pct)}'>"
@@ -914,7 +938,8 @@ for t, n in COMMODITIES.items():
         if d.get("gapped"): gapped_series.add(n)
         com_rows.append({"name": n, **d})
         if is_unusual(d["chg_1d"], d["sigma"]):
-            flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"]),
+            flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"],
+                                        session_word(h.index[-1].normalize())),
                  z_score(d["chg_1d"], d["sigma"]) or 2.0)
             flagged["commodities"] = True
 if com_rows:
@@ -934,7 +959,8 @@ for t, n in AGRO.items():
         if d.get("gapped"): gapped_series.add(n)
         agro_rows.append({"name": n, **d})
         if is_unusual(d["chg_1d"], d["sigma"]):
-            flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"]),
+            flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"],
+                                        session_word(h.index[-1].normalize())),
                  z_score(d["chg_1d"], d["sigma"]) or 2.0)
             flagged["agro"] = True
 if agro_rows:
@@ -976,7 +1002,8 @@ if dxy_hist is not None:
     if d.get("gapped"): gapped_series.add("DXY")
     data["dxy"] = d
     if d["chg_1d"] is not None and abs(d["chg_1d"]) >= 0.5:
-        flag(red_flags, f"Dollar Index moved {d['chg_1d']:+.2f}% today.",
+        flag(red_flags, f"Dollar Index moved {d['chg_1d']:+.2f}% "
+                        f"{session_word(dxy_hist.index[-1].normalize())}.",
              z_score(d["chg_1d"], d["sigma"]) or 2.0)
         flagged["dxy"] = True
     if is_flat(d["chg_1d"], d["sigma"]):
@@ -1006,7 +1033,8 @@ if hyg_hist is not None and lqd_hist is not None:
     if d.get("gapped"): gapped_series.add("HYG/LQD")
     data["credit"] = dict(ratio=ratio, **d)
     if d["chg_1d"] is not None and d["chg_1d"] <= -0.5:
-        flag(red_flags, f"Credit stress proxy (HYG/LQD) fell {d['chg_1d']:.2f}% today.",
+        flag(red_flags, f"Credit stress proxy (HYG/LQD) fell {d['chg_1d']:.2f}% "
+                        f"{session_word(ratio.index[-1].normalize())}.",
              z_score(d["chg_1d"], d["sigma"]) or 2.0)
         flagged["credit"] = True
     if is_flat(d["chg_1d"], d["sigma"]):
@@ -1029,7 +1057,8 @@ for t, n in CRYPTO.items():
         if d.get("gapped"): gapped_series.add(n)
         crypto_rows.append({"name": n, **d})
         if is_unusual(d["chg_1d"], d["sigma"]):
-            flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"]),
+            flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"],
+                                        session_word(h.index[-1].normalize())),
                  z_score(d["chg_1d"], d["sigma"]) or 2.0)
             flagged["crypto"] = True
 if crypto_rows:
@@ -1059,6 +1088,15 @@ if stale_names:
          f"the 1-day figures shown for them are not today's.", 3.0)
     notes.append(f"note that {', '.join(stale_names)} did not report a fresh bar")
 
+# What session the board as a whole is reporting. Crypto trades around the
+# clock so it always has a current bar; excluding it keeps this honest about
+# whether the session instruments have printed yet.
+SESSION_DATE = max((v for k, v in last_bar.items() if k not in set(CRYPTO.values())),
+                   default=None)
+SESSION_WORD = session_word(SESSION_DATE)
+PRE_SESSION = SESSION_DATE is not None and SESSION_DATE < market_today()
+data["session_date"], data["pre_session"] = SESSION_DATE, PRE_SESSION
+
 gapped_names = sorted(gapped_series)
 data["gapped"] = gapped_names
 if gapped_names:
@@ -1082,7 +1120,7 @@ def build_narrative():
 
     if not red_flags:
         base += (" Nothing here is flashing outside of normal ranges — context is clean, no single factor "
-                 "demands a defensive posture today.")
+                 "demands a defensive posture right now.")
         return base
 
     parts = [base, "", "A few things stand out enough to break down in more detail:"]
@@ -1099,7 +1137,7 @@ def build_narrative():
         parts.append(
             f"Index futures show a same-day dispersion of {data.get('futures_dispersion', 0):.2f} percentage points between "
             f"{data.get('futures_leader', 'the leader')} and {data.get('futures_laggard', 'the laggard')} — "
-            "today's move is concentrated in a specific market segment rather than broad-based."
+            f"the move is concentrated in a specific market segment rather than broad-based."
         )
     if flagged["commodities"]:
         moves = [f"{r['name']} {r['chg_1d']:+.1f}%" for r in data.get("commodities", []) if is_unusual(r["chg_1d"])]
@@ -1114,7 +1152,7 @@ def build_narrative():
         moves = [f"{r['name']} {r['chg_1d']:+.1f}%" for r in data.get("agro", []) if is_unusual(r["chg_1d"])]
         if moves:
             parts.append(
-                f"Grains moved more than usual today ({', '.join(moves)}) — large single-day moves here can "
+                f"Grains moved more than usual {SESSION_WORD} ({', '.join(moves)}) — large single-day moves here can "
                 "bleed into food inflation and related equity sectors."
             )
         else:
@@ -1137,7 +1175,7 @@ def build_narrative():
         d = data["credit"]
         if d["chg_1d"] is not None and d["chg_1d"] <= -0.5:
             parts.append(
-                f"The HYG/LQD credit stress proxy fell {d['chg_1d']:.2f}% today — worth monitoring for "
+                f"The HYG/LQD credit stress proxy fell {d['chg_1d']:.2f}% {SESSION_WORD} — worth monitoring for "
                 "follow-through over the next few sessions rather than treating a single-day move as conclusive."
             )
         else:
@@ -1158,7 +1196,17 @@ def build_narrative():
 top_l, top_r = st.columns([5, 1])
 with top_l:
     st.title("Macro Context Dashboard")
-    st.caption("On-demand snapshot — not a live stream · ~20 min delay tolerated on market data · daily on yields")
+    # State the session the change columns refer to. Left implicit, a "1D"
+    # read before the open silently meant the previous session.
+    if SESSION_DATE is None:
+        session_txt = "session data unavailable"
+    elif PRE_SESSION:
+        session_txt = (f"**1D = the session of {SESSION_DATE:%a %b %d}** — today's bar "
+                       f"has not printed yet, so the change columns are not today's move")
+    else:
+        session_txt = f"1D = today's session ({SESSION_DATE:%a %b %d}), in progress"
+    st.caption(f"On-demand snapshot — not a live stream · ~20 min delay tolerated on market "
+               f"data · daily on yields  \n{session_txt}")
 with top_r:
     st.write("")
     if st.button("🔄 Refresh", width="stretch"):
@@ -1274,11 +1322,18 @@ with right:
             df = pd.DataFrame(data["vix"]["rows"])
             render_change_table(data["vix"]["rows"], "Index", height=175)
             if df.get("suspect_1d", pd.Series(dtype=bool)).any():
-                st.markdown("<div class='small-caption'>⚠️ One or more 1D changes exceeded the sanity threshold "
+                st.markdown("<div class='small-caption'>One or more 1D changes exceeded the sanity threshold "
                             f"(±{SANITY_CAP_1D['vix']:.0f}%) and were suppressed as likely data glitches.</div>",
                             unsafe_allow_html=True)
-            st.plotly_chart(normalized_chart(vix_hist, PALETTE), width="stretch",
-                             config={"displayModeBar": False})
+            # Only plot tenors with continuous history. A normalised line drawn
+            # across a hole in the feed is a straight jump, not an evolution.
+            plot_series = {k: v for k, v in vix_hist.items() if k not in gapped_series}
+            if plot_series:
+                st.plotly_chart(normalized_chart(plot_series, PALETTE), width="stretch",
+                                 config={"displayModeBar": False})
+                if len(plot_series) < len(vix_hist):
+                    st.markdown(f"<div class='small-caption'>Chart: "
+                                f"{', '.join(plot_series)} only.</div>", unsafe_allow_html=True)
             shape_txt = "Contango (calm)" if data["vix"]["ordered"] else "⚠️ Inverted / backwardated (risk-off)"
             st.markdown(f"<div class='small-caption'>Shape: {shape_txt}</div>", unsafe_allow_html=True)
         else:
@@ -1296,7 +1351,7 @@ with right:
             st.plotly_chart(level_chart(d["ratio"].tail(22), color=ACCENT3),
                              width="stretch", config={"displayModeBar": False})
             if is_flat(d["chg_1d"], d["sigma"]):
-                note = "Ratio flat → high-yield and IG moving together → no signal today."
+                note = "Ratio flat → high-yield and IG moving together → no signal."
             elif d["chg_1d"] < 0:
                 note = "Ratio falling → high-yield underperforming IG → credit stress widening."
             else:
