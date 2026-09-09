@@ -11,7 +11,7 @@ Live: <https://marketdash1.streamlit.app/>
 
 | Card | Source | Notes |
 |---|---|---|
-| Rates & yield curve | FRED (`DGS2`/`DGS10`/`DGS30`) | Daily, published with a lag. Intraday reference from `^TNX`/`^TYX` |
+| Rates & yield curve | FRED + yfinance | Live 5Y/10Y/30Y lead the card (`^FVX`/`^TNX`/`^TYX`); FRED `DGS2/5/10/30` is the settled reference. The 2Y is estimated — see below |
 | Index futures | yfinance | ES / NQ / RTY, falling back to the cash index if a contract is unavailable |
 | Oil & metals | yfinance | WTI, gold, silver, copper |
 | Agro | yfinance | CBOT wheat, corn, soybeans |
@@ -38,6 +38,17 @@ and a coin that moves 65%.
   widening or easing; below that it reads as flat.
 - **Red flags** — ranked by size relative to that series' volatility, coloured
   red ≥3σ, amber ≥1.5σ, grey below.
+- **The 2Y yield is an estimate.** Yahoo publishes no live 2Y index, and
+  `2YY=F` is too thinly quoted to use (one 15-minute bar in five days, 14–20 bps
+  off the official yield, and a correlation of daily *changes* against it of
+  0.05). So the 2Y shown is FRED's settle carried forward by the 5Y's move since
+  that settle, scaled by β = 0.894 — measured over 495 sessions, correlation
+  0.89, intercept ≈ 0, β stable between 0.85 and 0.98 across six consecutive
+  sub-periods. Median error 1.2 bps, 2.6 bps at the 80th percentile. It is
+  labelled `(est)` wherever it appears.
+- **Credit ratio uses raw, not dividend-adjusted, prices.** HYG yields ~6.1% and
+  LQD ~4.7%, so adjusted history drifts the ratio upward by the carry
+  differential rather than by credit conditions.
 - **Stale data** — any series whose newest bar lags the rest of the board by a
   session is called out, so old figures are never presented as today's.
 

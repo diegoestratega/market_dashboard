@@ -80,6 +80,22 @@ CRYPTO = {"BTC-USD": "Bitcoin (BTC)", "ETH-USD": "Ethereum (ETH)"}
 VIX_TERM = ["^VIX9D", "^VIX", "^VIX3M", "^VIX6M"]
 DXY_TICKER = "DX-Y.NYB"
 
+# Live yield proxies. Yahoo publishes intraday indices for the 5Y, 10Y and 30Y
+# but has nothing for the 2Y: ^UST2Y/^US2Y do not exist, and 2YY=F (CBOT 2-Year
+# Yield futures) is too thinly quoted to use — one 15-minute bar in five days,
+# 14-20 bps away from the official yield, and a correlation of daily CHANGES
+# against the official 2Y of just 0.05.
+#
+# So the 2Y is carried forward instead: take FRED's settled 2Y and add the 5Y's
+# move since that settle, scaled by beta. Measured over 495 sessions the 2Y
+# moves 0.894 bps per bp of 5Y (correlation 0.89, intercept ~0, and the beta
+# held between 0.85 and 0.98 across six consecutive sub-periods). Median error
+# 1.2 bps, 2.6 bps at the 80th percentile. It is an estimate and is labelled
+# as one.
+LIVE_YIELD_TICKERS = {"5Y": "^FVX", "10Y": "^TNX", "30Y": "^TYX"}
+TWO_YEAR_BETA_ON_5Y = 0.894
+TWO_YEAR_EST_ERR_BPS = 2.6
+
 STANDARD_CFG = dict(week_n=5, month_n=21, month_window=21, year_window=252)
 CRYPTO_CFG = dict(week_n=7, month_n=30, month_window=30, year_window=365)
 
@@ -227,13 +243,18 @@ def _clean_history(hist: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1200, show_spinner=False)
-def fetch_yf_history(ticker: str, period: str = "1y", retries: int = 3):
+def fetch_yf_history(ticker: str, period: str = "1y", retries: int = 3, adjusted: bool = True):
     """One year by default, so a single fetch serves both the 1D/1W/1M columns
     and the 52-week level test. Fetching 3mo and 1y separately doubled the
-    request count (38 calls instead of 19) for identical numbers."""
+    request count (38 calls instead of 19) for identical numbers.
+
+    `adjusted=False` returns raw closes. Needed wherever the figure of interest
+    is price action rather than total return — see the credit ratio.
+    """
     for attempt in range(retries):
         try:
-            hist = yf.Ticker(ticker).history(period=period, interval="1d")
+            hist = yf.Ticker(ticker).history(period=period, interval="1d",
+                                             auto_adjust=adjusted)
             hist = _clean_history(hist)
             if hist is not None and not hist.empty:
                 closes = hist["Close"].dropna()
@@ -332,6 +353,21 @@ def bps_changes(series: pd.Series):
     sd = float(diffs.std()) if len(diffs) >= 12 else None
     return {"last": last, "chg_1d": chg(1), "chg_1w": chg(5), "chg_1m": chg(21),
             "sigma": sd if sd else None}
+
+
+def estimate_live_2y(fred_2y, fvx_daily, fvx_live):
+    """FRED's settled 2Y carried forward by the 5Y's move since that settle.
+
+    Anchored on the same session FRED last published, so the estimate is the
+    settle plus only the move that has happened since it.
+    """
+    if fred_2y is None or fvx_live is None or fvx_daily is None or fvx_daily.empty:
+        return None
+    settle_date = fred_2y.index[-1].normalize()
+    prior = fvx_daily[fvx_daily.index.normalize() <= settle_date]
+    if prior.empty:
+        return None
+    return float(fred_2y.iloc[-1] + TWO_YEAR_BETA_ON_5Y * (fvx_live - prior.iloc[-1]))
 
 
 def staleness(last_bar: dict, always_on=()):
@@ -562,16 +598,29 @@ def render_change_box(label, chg_pct):
             f"<div class='yield-label'>{label}</div>{body}</div>")
 
 
-def render_yield_box(label, value_pct, delta_bps, as_of, intraday_val, intraday_ts):
-    delta_cls = "yield-delta-pos" if (delta_bps or 0) >= 0 else "yield-delta-neg"
-    delta_html = f"<span class='yield-delta {delta_cls}'>{fmt_bps(delta_bps)}</span>" if delta_bps is not None else ""
-    if intraday_val is not None:
-        intraday_txt = f"Intraday: <b>{intraday_val:.2f}%</b> ({intraday_ts})"
+def render_yield_box(label, live_val, live_ts, settled_val, settled_as_of, estimated=False):
+    """Lead with the freshest number available, not the settled one.
+
+    FRED publishes a day in arrears, so the old layout put a stale figure in
+    the headline slot and hid the live quote in the caption. Here the live
+    yield is the headline, the chip is how far it has moved since the settle,
+    and the settled value is demoted to the sub-line for reference.
+    """
+    if live_val is not None:
+        move = (live_val - settled_val) * 100 if settled_val is not None else None
+        cls = "yield-delta-pos" if (move or 0) >= 0 else "yield-delta-neg"
+        chip = f"<span class='yield-delta {cls}'>{fmt_bps(move)}</span>" if move is not None else ""
+        tag = " · est" if estimated else ""
+        head = f"{live_val:.2f}%{chip}"
+        sub = f"{live_ts}{tag}"
+        if settled_val is not None:
+            sub += f" &nbsp;·&nbsp; settled {settled_val:.2f}% ({settled_as_of})"
     else:
-        intraday_txt = "Intraday: n/a"
-    sub = f"As of {as_of} (delayed) &nbsp;·&nbsp; {intraday_txt}"
-    return (f"<div class='yield-box'><div class='yield-label'>{label}</div>"
-            f"<div class='yield-value'>{value_pct:.2f}%{delta_html}</div>"
+        head = f"{settled_val:.2f}%" if settled_val is not None else "—"
+        sub = f"settled {settled_as_of} — no live quote"
+    label_html = f"{label}<span style='color:{MUTED}'>{' (est)' if estimated else ''}</span>"
+    return (f"<div class='yield-box'><div class='yield-label'>{label_html}</div>"
+            f"<div class='yield-value'>{head}</div>"
             f"<div class='yield-sub'>{sub}</div></div>")
 
 
@@ -635,19 +684,22 @@ flagged = {"rates": False, "futures": False, "commodities": False, "agro": False
 # --- Rates ---
 if FRED_API_KEY:
     y2, as_of_2 = fetch_fred_series("DGS2")
+    y5, as_of_5 = fetch_fred_series("DGS5")
     y10, as_of_10 = fetch_fred_series("DGS10")
     y30, as_of_30 = fetch_fred_series("DGS30")
     if y2 is not None and y10 is not None and y30 is not None:
         c2, c10, c30 = bps_changes(y2), bps_changes(y10), bps_changes(y30)
+        c5 = bps_changes(y5) if y5 is not None else None
         slope_10s2s = (y10.iloc[-1] - y2.iloc[-1]) * 100
         slope_30s10s = (y30.iloc[-1] - y10.iloc[-1]) * 100
         slope_10s2s_1d = (y10.iloc[-2] - y2.iloc[-2]) * 100 if len(y10) > 1 and len(y2) > 1 else None
         trend_10s2s = None
         if slope_10s2s_1d is not None:
             trend_10s2s = "steepening" if slope_10s2s > slope_10s2s_1d else "flattening"
-        data["rates"] = dict(y2=y2, y10=y10, y30=y30, c2=c2, c10=c10, c30=c30,
+        data["rates"] = dict(y2=y2, y5=y5, y10=y10, y30=y30, c2=c2, c5=c5, c10=c10, c30=c30,
                               slope_10s2s=slope_10s2s, slope_30s10s=slope_30s10s,
-                              trend_10s2s=trend_10s2s, as_of=as_of_10, as_of_2=as_of_2, as_of_30=as_of_30)
+                              trend_10s2s=trend_10s2s, as_of=as_of_10, as_of_2=as_of_2,
+                              as_of_5=as_of_5, as_of_30=as_of_30)
         if slope_10s2s < 0:
             flag(red_flags, f"2s10s curve is inverted ({slope_10s2s:.0f} bps).", 3.5)
             flagged["rates"] = True
@@ -658,14 +710,29 @@ if FRED_API_KEY:
         # gets ranked on the same footing as everything else.
         rate_rows = [{"name": "2Y", "level": level_status(y2),
                       "chg_1d": c2["chg_1d"], "sigma": c2["sigma"], "unit": " bps"},
+                     {"name": "5Y", "level": level_status(y5) if y5 is not None else None,
+                      "chg_1d": c5["chg_1d"] if c5 else None,
+                      "sigma": c5["sigma"] if c5 else None, "unit": " bps"},
                      {"name": "10Y", "level": level_status(y10),
                       "chg_1d": c10["chg_1d"], "sigma": c10["sigma"], "unit": " bps"},
                      {"name": "30Y", "level": level_status(y30),
                       "chg_1d": c30["chg_1d"], "sigma": c30["sigma"], "unit": " bps"}]
         collect_level_notes(rate_rows, "rates", flagged, red_flags, big_picture)
 
-intraday_10y, intraday_10y_ts = fetch_intraday_quote("^TNX")
-intraday_30y, intraday_30y_ts = fetch_intraday_quote("^TYX")
+# Live yields. These lead the rates card; FRED is the settled reference.
+live_yield = {}
+for tenor, tk in LIVE_YIELD_TICKERS.items():
+    val, ts = fetch_intraday_quote(tk)
+    live_yield[tenor] = {"value": val, "ts": ts}
+
+# The 2Y has no live index, so carry the settle forward on the 5Y's move.
+fvx_daily, _ = fetch_yf_history(LIVE_YIELD_TICKERS["5Y"])
+live_yield["2Y"] = {
+    "value": estimate_live_2y(data.get("rates", {}).get("y2"), fvx_daily,
+                              live_yield["5Y"]["value"]),
+    "ts": live_yield["5Y"]["ts"],
+    "estimated": True,
+}
 
 # --- Index futures ---
 fut_hist = {}
@@ -786,8 +853,14 @@ if dxy_hist is not None:
                           "sigma": d["sigma"]}], "dxy", flagged, red_flags, big_picture)
 
 # --- Credit stress ---
-hyg_hist, _ = fetch_yf_history("HYG")
-lqd_hist, _ = fetch_yf_history("LQD")
+# Raw closes, not dividend-adjusted. HYG yields ~6.1% and LQD ~4.7%, so
+# auto-adjusted history depresses HYG's past by ~1.4pp more than LQD's, which
+# drifts the ratio upward for reasons that are carry, not credit stress. On
+# adjusted data the 1-month change read +0.11% where the actual price ratio was
+# -0.02%; the 52-week range position moved 0.914 -> 0.950. The 1-day change is
+# unaffected either way, and matches an independent quote source exactly.
+hyg_hist, _ = fetch_yf_history("HYG", adjusted=False)
+lqd_hist, _ = fetch_yf_history("LQD", adjusted=False)
 if hyg_hist is not None and lqd_hist is not None:
     joined = pd.concat([hyg_hist, lqd_hist], axis=1, join="inner")
     joined.columns = ["HYG", "LQD"]
@@ -990,22 +1063,38 @@ with left:
     with card("Rates & Yield Curve", flagged["rates"]):
         if "rates" in data:
             r = data["rates"]
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown(render_yield_box("2Y", r["y2"].iloc[-1], r["c2"]["chg_1d"], r["as_of_2"],
-                                              None, None), unsafe_allow_html=True)
-            with c2:
-                st.markdown(render_yield_box("10Y", r["y10"].iloc[-1], r["c10"]["chg_1d"], r["as_of"],
-                                              intraday_10y, intraday_10y_ts), unsafe_allow_html=True)
-            with c3:
-                st.markdown(render_yield_box("30Y", r["y30"].iloc[-1], r["c30"]["chg_1d"], r["as_of_30"],
-                                              intraday_30y, intraday_30y_ts), unsafe_allow_html=True)
+            settled = {"2Y": (r["y2"].iloc[-1], r["as_of_2"]),
+                       "5Y": (r["y5"].iloc[-1], r["as_of_5"]) if r.get("y5") is not None else (None, None),
+                       "10Y": (r["y10"].iloc[-1], r["as_of"]),
+                       "30Y": (r["y30"].iloc[-1], r["as_of_30"])}
+            for col, tenor in zip(st.columns(4), ["2Y", "5Y", "10Y", "30Y"]):
+                lv = live_yield.get(tenor, {})
+                s_val, s_as_of = settled[tenor]
+                with col:
+                    st.markdown(render_yield_box(tenor, lv.get("value"), lv.get("ts"),
+                                                 s_val, s_as_of, lv.get("estimated", False)),
+                                unsafe_allow_html=True)
 
-            st.markdown(f"<div class='small-caption' style='margin-top:10px;'>10s2s: {r['slope_10s2s']:.0f} bps "
-                        f"({r['trend_10s2s'] or '—'}) &nbsp;·&nbsp; 30s10s: {r['slope_30s10s']:.0f} bps</div>",
+            # Curve from the live quotes where they exist, settled alongside.
+            live_2y, live_10y = live_yield.get("2Y", {}).get("value"), live_yield.get("10Y", {}).get("value")
+            live_30y = live_yield.get("30Y", {}).get("value")
+            curve_bits = [f"10s2s: <b>{r['slope_10s2s']:.0f} bps</b> settled ({r['trend_10s2s'] or '—'})"]
+            if live_2y is not None and live_10y is not None:
+                curve_bits.append(f"~{(live_10y - live_2y) * 100:.0f} bps live (est)")
+            curve_bits.append(f"30s10s: <b>{r['slope_30s10s']:.0f} bps</b> settled")
+            if live_10y is not None and live_30y is not None:
+                curve_bits.append(f"~{(live_30y - live_10y) * 100:.0f} bps live")
+            st.markdown(f"<div class='small-caption' style='margin-top:10px;'>"
+                        f"{' &nbsp;·&nbsp; '.join(curve_bits)}<br>"
+                        f"Live 5Y/10Y/30Y from ^FVX/^TNX/^TYX (~15 min delay). The 2Y has no live "
+                        f"index, so it is FRED's settle carried forward on the 5Y's move "
+                        f"(β={TWO_YEAR_BETA_ON_5Y}, typical error ±{TWO_YEAR_EST_ERR_BPS:.1f} bps).</div>",
                         unsafe_allow_html=True)
             st.write("")
             chart_series = {"2Y": r["y2"].tail(66), "10Y": r["y10"].tail(66), "30Y": r["y30"].tail(66)}
+            if r.get("y5") is not None:
+                chart_series = {"2Y": r["y2"].tail(66), "5Y": r["y5"].tail(66),
+                                "10Y": r["y10"].tail(66), "30Y": r["y30"].tail(66)}
             st.plotly_chart(multi_level_chart(chart_series, PALETTE, ticksuffix="%"),
                              width="stretch", config={"displayModeBar": False})
         else:
