@@ -40,7 +40,22 @@ def get_secret(name: str, default: str = ""):
         return os.environ.get(name, default)
 
 
+# A move is unusual if EITHER test fires — whichever happens first:
+#   >= UNUSUAL_MOVE_SIGMA of the series' own daily standard deviation, so a
+#     move that is genuinely large for that series counts however small it
+#     looks in absolute terms;
+#   >= UNUSUAL_MOVE_PCT in absolute terms, so a violent day still flags even
+#     after a sustained high-vol stretch has pulled sigma up to meet it.
 UNUSUAL_MOVE_PCT = 3.0
+UNUSUAL_MOVE_SIGMA = 1.5
+
+# Intraday stamps are shown in US market time and labelled. yfinance returns
+# each exchange's own zone (Chicago for ^TNX, New York for equities).
+MARKET_TZ = "America/New_York"
+
+# A series whose newest bar lags the rest of the board by a session is stale;
+# its "today" figures would be yesterday's while still being labelled today.
+STALE_SESSION_LAG = 1
 
 # "Near" a 52-week extreme is measured against the series' own 52-week RANGE,
 # not as a fixed percentage of price. A flat 1% band treated HYG/LQD — whose
@@ -173,23 +188,33 @@ def card(title: str, flagged: bool = False):
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fetch_fred_series(series_id: str, limit: int = 270):
+    """Returns (series, as_of). Never raises: an expired or mistyped key would
+    otherwise take the whole page down on raise_for_status()."""
     if not FRED_API_KEY:
         return None, None
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {"series_id": series_id, "api_key": FRED_API_KEY, "file_type": "json",
               "sort_order": "desc", "limit": limit}
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    obs = r.json().get("observations", [])
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        obs = r.json().get("observations", [])
+    except Exception:
+        return None, None
     rows = [(o["date"], o["value"]) for o in obs if o["value"] != "."]
     rows.reverse()
+    if not rows:
+        return None, None
     df = pd.DataFrame(rows, columns=["date", "value"]).astype({"value": float})
     df["date"] = pd.to_datetime(df["date"])
-    as_of = df["date"].iloc[-1].strftime("%b %d") if not df.empty else None
+    as_of = df["date"].iloc[-1].strftime("%b %d")
     return df.set_index("date")["value"], as_of
 
 
 def _clean_history(hist: pd.DataFrame) -> pd.DataFrame:
+    """Collapse a DAILY history to one row per session. Never call this on
+    intraday bars — it keeps only the last bar of each day, which silently
+    discarded 130 of 135 fifteen-minute bars where it used to be applied."""
     if hist is None or hist.empty:
         return hist
     hist = hist.copy()
@@ -202,7 +227,10 @@ def _clean_history(hist: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1200, show_spinner=False)
-def fetch_yf_history(ticker: str, period: str = "3mo", retries: int = 3):
+def fetch_yf_history(ticker: str, period: str = "1y", retries: int = 3):
+    """One year by default, so a single fetch serves both the 1D/1W/1M columns
+    and the 52-week level test. Fetching 3mo and 1y separately doubled the
+    request count (38 calls instead of 19) for identical numbers."""
     for attempt in range(retries):
         try:
             hist = yf.Ticker(ticker).history(period=period, interval="1d")
@@ -223,11 +251,10 @@ def fetch_yf_history(ticker: str, period: str = "3mo", retries: int = 3):
 def fetch_intraday_quote(ticker: str):
     try:
         hist = yf.Ticker(ticker).history(period="5d", interval="15m")
-        hist = _clean_history(hist) if hist is not None and not hist.empty else hist
         if hist is not None and not hist.empty:
-            last = hist["Close"].dropna().iloc[-1]
-            ts = hist.index[-1]
-            return float(last), ts.strftime("%H:%M")
+            closes = hist["Close"].dropna()
+            if not closes.empty:
+                return float(closes.iloc[-1]), format_market_time(closes.index[-1])
     except Exception:
         pass
     hist, as_of = fetch_yf_history(ticker, period="5d")
@@ -295,13 +322,32 @@ def pct_changes(series: pd.Series, cap: float = None, week_n: int = 5, month_n: 
 def bps_changes(series: pd.Series):
     s = series.dropna()
     if s.empty:
-        return {"last": None, "chg_1d": None, "chg_1w": None, "chg_1m": None}
+        return {"last": None, "chg_1d": None, "chg_1w": None, "chg_1m": None, "sigma": None}
     last = s.iloc[-1]
 
     def chg(n):
         return (last - s.iloc[-1 - n]) * 100 if len(s) > n else None
 
-    return {"last": last, "chg_1d": chg(1), "chg_1w": chg(5), "chg_1m": chg(21)}
+    diffs = (s.diff().dropna() * 100).tail(63)
+    sd = float(diffs.std()) if len(diffs) >= 12 else None
+    return {"last": last, "chg_1d": chg(1), "chg_1w": chg(5), "chg_1m": chg(21),
+            "sigma": sd if sd else None}
+
+
+def staleness(last_bar: dict, always_on=()):
+    """Series whose newest bar lags the rest of the board by a session.
+
+    Calibrated against the newest bar actually observed rather than against the
+    calendar, so weekends and market holidays need no special handling. Assets
+    that trade 24/7 are held out of the consensus, since at a weekend they
+    legitimately run ahead of everything that trades in sessions.
+    """
+    session = {k: v for k, v in last_bar.items() if k not in always_on}
+    if not session:
+        return []
+    newest = max(session.values())
+    return sorted(k for k, v in session.items()
+                  if (newest - v).days >= STALE_SESSION_LAG)
 
 
 def daily_sigma(series: pd.Series, window: int = 63):
@@ -367,8 +413,39 @@ def fmt_bps(x):
     return "—" if x is None else f"{x:+.0f} bps"
 
 
-def is_unusual(chg_1d_pct):
-    return chg_1d_pct is not None and abs(chg_1d_pct) >= UNUSUAL_MOVE_PCT
+def is_unusual(chg_1d_pct, sigma=None):
+    """Either test firing is enough: big for this series, or big outright.
+
+    A fixed percentage alone never fired on a genuinely extreme day in
+    something quiet like the credit ratio; a sigma test alone would go silent
+    on a violent day once a high-vol stretch had raised sigma to match it.
+    """
+    if chg_1d_pct is None:
+        return False
+    if abs(chg_1d_pct) >= UNUSUAL_MOVE_PCT:
+        return True
+    z = z_score(chg_1d_pct, sigma)
+    return z is not None and z >= UNUSUAL_MOVE_SIGMA
+
+
+def move_phrase(name, chg_pct, sigma):
+    """'Corn moved +3.4% today (2.1σ)' — the sigma makes the size legible."""
+    z = z_score(chg_pct, sigma)
+    tail = f" ({z:.1f}σ)" if z is not None else ""
+    return f"{name} moved {chg_pct:+.1f}% today{tail}."
+
+
+def format_market_time(ts):
+    """Intraday stamps in US market time, explicitly labelled.
+
+    The previous code ran intraday timestamps through tz_localize(None), which
+    kept the wall-clock reading of whichever exchange zone yfinance returned
+    and then displayed it with no zone at all — a 14:50 ET bar showed as 13:50.
+    """
+    ts = pd.Timestamp(ts)
+    if ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert(MARKET_TZ).strftime("%H:%M ET")
 
 
 def z_score(chg_pct, sigma):
@@ -469,6 +546,22 @@ def multi_level_chart(series_dict: dict, colors, height=CHART_HEIGHT, ticksuffix
     return base_layout(fig, height, legend=True, y_range=y_range)
 
 
+def render_change_box(label, chg_pct):
+    """One period's change, coloured. Used for 1D/1W/1M alike.
+
+    These three used to be encoded three different ways in the same card: 1D
+    as a small coloured st.metric delta, 1W and 1M as large plain values, so
+    the same quantity looked like different kinds of thing.
+    """
+    if chg_pct is None:
+        body = f"<div class='yield-value' style='color:{MUTED}'>—</div>"
+    else:
+        colour = POS if chg_pct >= 0 else NEG
+        body = f"<div class='yield-value' style='color:{colour}'>{chg_pct:+.2f}%</div>"
+    return (f"<div class='yield-box' style='min-height:70px'>"
+            f"<div class='yield-label'>{label}</div>{body}</div>")
+
+
 def render_yield_box(label, value_pct, delta_bps, as_of, intraday_val, intraday_ts):
     delta_cls = "yield-delta-pos" if (delta_bps or 0) >= 0 else "yield-delta-neg"
     delta_html = f"<span class='yield-delta {delta_cls}'>{fmt_bps(delta_bps)}</span>" if delta_bps is not None else ""
@@ -522,7 +615,8 @@ def collect_level_notes(rows, group_key, flagged, red_flags, big_picture):
         if z is None:
             flag(red_flags, msg + ".", 1.5)
         else:
-            flag(red_flags, f"{msg} (on a {abs(r['chg_1d']):.1f}% move, {z:.1f}σ).", z)
+            unit = r.get("unit", "%")
+            flag(red_flags, f"{msg} (on a {abs(r['chg_1d']):.1f}{unit} move, {z:.1f}σ).", z)
         flagged[group_key] = True
 
 
@@ -534,6 +628,7 @@ data = {}
 red_flags = []
 notes = []
 big_picture = []
+last_bar = {}          # name -> newest session in that series, for staleness
 flagged = {"rates": False, "futures": False, "commodities": False, "agro": False,
            "vix": False, "dxy": False, "credit": False, "crypto": False}
 
@@ -559,9 +654,14 @@ if FRED_API_KEY:
         if trend_10s2s:
             notes.append(f"the 2s10s curve is {trend_10s2s} ({slope_10s2s:.0f} bps)")
 
-        rate_rows = [{"name": "2Y", "level": level_status(y2)},
-                     {"name": "10Y", "level": level_status(y10)},
-                     {"name": "30Y", "level": level_status(y30)}]
+        # Yields carry their bps move and bps volatility so a 52-week level
+        # gets ranked on the same footing as everything else.
+        rate_rows = [{"name": "2Y", "level": level_status(y2),
+                      "chg_1d": c2["chg_1d"], "sigma": c2["sigma"], "unit": " bps"},
+                     {"name": "10Y", "level": level_status(y10),
+                      "chg_1d": c10["chg_1d"], "sigma": c10["sigma"], "unit": " bps"},
+                     {"name": "30Y", "level": level_status(y30),
+                      "chg_1d": c30["chg_1d"], "sigma": c30["sigma"], "unit": " bps"}]
         collect_level_notes(rate_rows, "rates", flagged, red_flags, big_picture)
 
 intraday_10y, intraday_10y_ts = fetch_intraday_quote("^TNX")
@@ -574,24 +674,31 @@ for t, n in FUTURES.items():
     h, label, used_ticker = fetch_future_with_fallback(t, n)
     if h is not None:
         d = pct_changes(h, **{k: v for k, v in STANDARD_CFG.items() if k in ("week_n", "month_n")})
-        h_1y, _ = fetch_yf_history(used_ticker, period="1y")
-        d["level"] = level_status(h_1y, STANDARD_CFG["month_window"], STANDARD_CFG["year_window"]) if h_1y is not None else None
+        d["level"] = level_status(h, STANDARD_CFG["month_window"], STANDARD_CFG["year_window"])
         fut_hist[label] = h.tail(22)
+        last_bar[label] = h.index[-1].normalize()
         fut_rows.append({"name": label, **d})
 if fut_rows:
     data["futures"] = fut_rows
-    valid = [r["chg_1d"] for r in fut_rows if r["chg_1d"] is not None]
-    if valid:
-        dispersion = max(valid) - min(valid)
-        leader = max(fut_rows, key=lambda r: r["chg_1d"] or -999)
-        laggard = min(fut_rows, key=lambda r: r["chg_1d"] or 999)
+    # Compare only contracts that actually reported. `r["chg_1d"] or -999`
+    # treated a genuinely flat 0.00% as missing and mis-picked the leader.
+    scored = [r for r in fut_rows if r["chg_1d"] is not None]
+    if scored:
+        dispersion = max(r["chg_1d"] for r in scored) - min(r["chg_1d"] for r in scored)
+        leader = max(scored, key=lambda r: r["chg_1d"])
+        laggard = min(scored, key=lambda r: r["chg_1d"])
+        partial = len(scored) < len(fut_rows)
+        coverage = f" across {len(scored)} of {len(fut_rows)} contracts" if partial else ""
         data["futures_dispersion"] = dispersion
+        data["futures_partial"] = partial
+        data["futures_coverage"] = coverage
         data["futures_leader"], data["futures_laggard"] = leader["name"], laggard["name"]
         notes.append(f"equity futures show {'broad, aligned' if dispersion < 0.5 else 'narrow, divergent'} "
                      f"participation ({leader['name']} leading, {laggard['name']} lagging)")
         if dispersion >= 1.0:
             flag(red_flags,
-                 f"Wide dispersion across index futures ({dispersion:.1f} percentage points).",
+                 f"Wide dispersion across index futures "
+                 f"({dispersion:.1f} percentage points{coverage}).",
                  dispersion / 0.5)
             flagged["futures"] = True
     collect_level_notes(fut_rows, "futures", flagged, red_flags, big_picture)
@@ -603,13 +710,12 @@ for t, n in COMMODITIES.items():
     h, _ = fetch_yf_history(t)
     if h is not None:
         d = pct_changes(h)
-        h_1y, _ = fetch_yf_history(t, period="1y")
-        d["level"] = level_status(h_1y) if h_1y is not None else None
+        d["level"] = level_status(h)
         com_hist[n] = h.tail(22)
+        last_bar[n] = h.index[-1].normalize()
         com_rows.append({"name": n, **d})
-        if is_unusual(d["chg_1d"]):
-            flag(red_flags,
-                 f"{n} moved {d['chg_1d']:+.1f}% today (≥{UNUSUAL_MOVE_PCT:.0f}% threshold).",
+        if is_unusual(d["chg_1d"], d["sigma"]):
+            flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"]),
                  z_score(d["chg_1d"], d["sigma"]) or 2.0)
             flagged["commodities"] = True
 if com_rows:
@@ -623,13 +729,12 @@ for t, n in AGRO.items():
     h, _ = fetch_yf_history(t)
     if h is not None:
         d = pct_changes(h)
-        h_1y, _ = fetch_yf_history(t, period="1y")
-        d["level"] = level_status(h_1y) if h_1y is not None else None
+        d["level"] = level_status(h)
         agro_hist[n] = h.tail(22)
+        last_bar[n] = h.index[-1].normalize()
         agro_rows.append({"name": n, **d})
-        if is_unusual(d["chg_1d"]):
-            flag(red_flags,
-                 f"{n} moved {d['chg_1d']:+.1f}% today (≥{UNUSUAL_MOVE_PCT:.0f}% threshold).",
+        if is_unusual(d["chg_1d"], d["sigma"]):
+            flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"]),
                  z_score(d["chg_1d"], d["sigma"]) or 2.0)
             flagged["agro"] = True
 if agro_rows:
@@ -644,10 +749,10 @@ for t in VIX_TERM:
     h, _ = fetch_yf_history(t)
     if h is not None:
         d = pct_changes(h, cap=SANITY_CAP_1D["vix"])
-        h_1y, _ = fetch_yf_history(t, period="1y")
-        d["level"] = level_status(h_1y) if h_1y is not None else None
+        d["level"] = level_status(h)
         label = t.replace("^", "")
         vix_hist[label] = h.tail(22)
+        last_bar[label] = h.index[-1].normalize()
         vix_rows.append({"name": label, **d})
         vix_levels[t] = d["last"]
 if vix_rows:
@@ -665,8 +770,8 @@ if vix_rows:
 dxy_hist, _ = fetch_yf_history(DXY_TICKER)
 if dxy_hist is not None:
     d = pct_changes(dxy_hist)
-    dxy_1y, _ = fetch_yf_history(DXY_TICKER, period="1y")
-    d["level"] = level_status(dxy_1y) if dxy_1y is not None else None
+    d["level"] = level_status(dxy_hist)
+    last_bar["DXY"] = dxy_hist.index[-1].normalize()
     data["dxy"] = d
     if d["chg_1d"] is not None and abs(d["chg_1d"]) >= 0.5:
         flag(red_flags, f"Dollar Index moved {d['chg_1d']:+.2f}% today.",
@@ -688,15 +793,8 @@ if hyg_hist is not None and lqd_hist is not None:
     joined.columns = ["HYG", "LQD"]
     ratio = joined["HYG"] / joined["LQD"]
     d = pct_changes(ratio)
-    hyg_1y, _ = fetch_yf_history("HYG", period="1y")
-    lqd_1y, _ = fetch_yf_history("LQD", period="1y")
-    if hyg_1y is not None and lqd_1y is not None:
-        joined_1y = pd.concat([hyg_1y, lqd_1y], axis=1, join="inner")
-        joined_1y.columns = ["HYG", "LQD"]
-        ratio_1y = joined_1y["HYG"] / joined_1y["LQD"]
-        d["level"] = level_status(ratio_1y)
-    else:
-        d["level"] = None
+    d["level"] = level_status(ratio)
+    last_bar["HYG/LQD"] = ratio.index[-1].normalize()
     data["credit"] = dict(ratio=ratio, **d)
     if d["chg_1d"] is not None and d["chg_1d"] <= -0.5:
         flag(red_flags, f"Credit stress proxy (HYG/LQD) fell {d['chg_1d']:.2f}% today.",
@@ -716,13 +814,12 @@ for t, n in CRYPTO.items():
     h, _ = fetch_yf_history(t)
     if h is not None:
         d = pct_changes(h, week_n=CRYPTO_CFG["week_n"], month_n=CRYPTO_CFG["month_n"])
-        h_1y, _ = fetch_yf_history(t, period="1y")
-        d["level"] = level_status(h_1y, CRYPTO_CFG["month_window"], CRYPTO_CFG["year_window"]) if h_1y is not None else None
+        d["level"] = level_status(h, CRYPTO_CFG["month_window"], CRYPTO_CFG["year_window"])
         crypto_hist[n] = h.tail(30)
+        last_bar[n] = h.index[-1].normalize()
         crypto_rows.append({"name": n, **d})
-        if is_unusual(d["chg_1d"]):
-            flag(red_flags,
-                 f"{n} moved {d['chg_1d']:+.1f}% today (≥{UNUSUAL_MOVE_PCT:.0f}% threshold).",
+        if is_unusual(d["chg_1d"], d["sigma"]):
+            flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"]),
                  z_score(d["chg_1d"], d["sigma"]) or 2.0)
             flagged["crypto"] = True
 if crypto_rows:
@@ -736,6 +833,18 @@ high_impact_soon = [e for e in events if str(e.get("impact", "")).lower() in ("h
 if high_impact_soon:
     titles = ", ".join(sorted({e.get("title", "") for e in high_impact_soon}))
     notes.append(f"high-impact releases on deck this week ({titles})")
+
+# --- Data freshness ---
+# Nothing previously noticed a frozen feed: a series stuck on an old bar had
+# its stale figures reported as "today" with full confidence.
+stale_names = staleness(last_bar, always_on=set(CRYPTO.values()))
+data["stale"] = stale_names
+if stale_names:
+    flag(red_flags,
+         f"Stale data — {', '.join(stale_names)} "
+         f"{'is' if len(stale_names) == 1 else 'are'} behind the rest of the board; "
+         f"the 1-day figures shown for them are not today's.", 3.0)
+    notes.append(f"note that {', '.join(stale_names)} did not report a fresh bar")
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +1009,11 @@ with left:
             st.plotly_chart(multi_level_chart(chart_series, PALETTE, ticksuffix="%"),
                              width="stretch", config={"displayModeBar": False})
         else:
-            st.warning("Add FRED_API_KEY in Secrets to enable this section.")
+            if FRED_API_KEY:
+                st.error("FRED request failed — the key may be expired or rate-limited. "
+                         "Everything else on this page is unaffected.")
+            else:
+                st.warning("Add FRED_API_KEY in Secrets to enable this section.")
 
     with card("Oil & Metals", flagged["commodities"]):
         if "commodities" in data:
@@ -914,7 +1027,7 @@ with left:
                          width="stretch", height=175)
             st.plotly_chart(normalized_chart(com_hist, PALETTE), width="stretch",
                              config={"displayModeBar": False})
-            st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day)</div>",
+            st.markdown(f"<div class='small-caption'>Unusual move: ≥{UNUSUAL_MOVE_SIGMA:.1f}σ of this series' own daily vol, or ≥±{UNUSUAL_MOVE_PCT:.0f}% outright</div>",
                         unsafe_allow_html=True)
         else:
             st.error("Could not load commodity data.")
@@ -931,7 +1044,7 @@ with left:
                          width="stretch", height=145)
             st.plotly_chart(normalized_chart(agro_hist, PALETTE), width="stretch",
                              config={"displayModeBar": False})
-            st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day) "
+            st.markdown(f"<div class='small-caption'>Unusual move: ≥{UNUSUAL_MOVE_SIGMA:.1f}σ of this series' own daily vol, or ≥±{UNUSUAL_MOVE_PCT:.0f}% outright "
                         f"&nbsp;·&nbsp; CBOT futures, yfinance</div>", unsafe_allow_html=True)
         else:
             st.error("Could not load agro data.")
@@ -962,10 +1075,11 @@ with right:
     with card("Credit Stress (HYG / LQD)", flagged["credit"]):
         if "credit" in data:
             d = data["credit"]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Ratio", f"{d['last']:.3f}", fmt_pct(d["chg_1d"]))
-            c2.metric("1W", fmt_pct(d["chg_1w"]))
-            c3.metric("1M", fmt_pct(d["chg_1m"]))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Ratio", f"{d['last']:.3f}")
+            for col, lab, key in ((c2, "1 day", "chg_1d"), (c3, "1 week", "chg_1w"),
+                                  (c4, "1 month", "chg_1m")):
+                col.markdown(render_change_box(lab, d[key]), unsafe_allow_html=True)
             st.write("")
             st.plotly_chart(level_chart(d["ratio"].tail(22), color=ACCENT3),
                              width="stretch", config={"displayModeBar": False})
@@ -982,10 +1096,11 @@ with right:
     with card("Dollar Index (DXY)", flagged["dxy"]):
         if "dxy" in data:
             d = data["dxy"]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("DXY", f"{d['last']:.2f}", fmt_pct(d["chg_1d"]))
-            c2.metric("1W", fmt_pct(d["chg_1w"]))
-            c3.metric("1M", fmt_pct(d["chg_1m"]))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("DXY", f"{d['last']:.2f}")
+            for col, lab, key in ((c2, "1 day", "chg_1d"), (c3, "1 week", "chg_1w"),
+                                  (c4, "1 month", "chg_1m")):
+                col.markdown(render_change_box(lab, d[key]), unsafe_allow_html=True)
             st.write("")
             st.plotly_chart(level_chart(dxy_hist.tail(22), color=ACCENT2),
                              width="stretch", config={"displayModeBar": False})
@@ -1004,7 +1119,7 @@ with right:
                          width="stretch", height=110)
             st.plotly_chart(normalized_chart(crypto_hist, PALETTE), width="stretch",
                              config={"displayModeBar": False})
-            st.markdown(f"<div class='small-caption'>Unusual-move threshold: ±{UNUSUAL_MOVE_PCT:.0f}% (1-day) "
+            st.markdown(f"<div class='small-caption'>Unusual move: ≥{UNUSUAL_MOVE_SIGMA:.1f}σ of this series' own daily vol, or ≥±{UNUSUAL_MOVE_PCT:.0f}% outright "
                         f"&nbsp;·&nbsp; 1W/1M use 7-/30-day lookbacks (24/7 trading)</div>", unsafe_allow_html=True)
         else:
             st.error("Could not load crypto data.")
@@ -1027,5 +1142,6 @@ with card("Macro Calendar — CPI / NFP / FOMC / PCE (USD, this week)"):
         st.dataframe(cal_df, hide_index=True, width="stretch", height=190)
     else:
         st.info("No matching USD events this week, or the calendar feed is unavailable.")
-    st.markdown(f"<div class='small-caption'>Fetched {fetched_at} · ForexFactory public calendar feed, cached ~6h</div>",
+    fetched_note = f"Fetched {fetched_at}" if fetched_at else "Feed unreachable — last fetch failed"
+    st.markdown(f"<div class='small-caption'>{fetched_note} · ForexFactory public calendar feed, cached ~6h</div>",
                 unsafe_allow_html=True)
