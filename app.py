@@ -41,7 +41,18 @@ def get_secret(name: str, default: str = ""):
 
 
 UNUSUAL_MOVE_PCT = 3.0
-NEAR_52W_PCT = 1.0
+
+# "Near" a 52-week extreme is measured against the series' own 52-week RANGE,
+# not as a fixed percentage of price. A flat 1% band treated HYG/LQD — whose
+# whole yearly range is a couple of percent — as permanently near its high,
+# while being pure noise for crypto.
+NEAR_52W_RANGE_FRAC = 0.02
+
+# Moves smaller than this multiple of the series' own daily standard deviation
+# are called flat rather than given a direction. Stops a -0.02% tick on the
+# credit ratio being reported as "widening".
+FLAT_SIGMA_FRAC = 0.3
+
 FRED_API_KEY = get_secret("FRED_API_KEY")
 
 FUTURES = {"ES=F": "S&P 500 (ES)", "NQ=F": "Nasdaq 100 (NQ)", "RTY=F": "Russell 2000 (RTY)"}
@@ -265,7 +276,8 @@ def fetch_future_with_fallback(ticker: str, label: str):
 def pct_changes(series: pd.Series, cap: float = None, week_n: int = 5, month_n: int = 21):
     s = series.dropna()
     if s.empty:
-        return {"last": None, "chg_1d": None, "chg_1w": None, "chg_1m": None, "suspect_1d": False}
+        return {"last": None, "chg_1d": None, "chg_1w": None, "chg_1m": None,
+                "suspect_1d": False, "sigma": None}
     last = s.iloc[-1]
 
     def chg(n):
@@ -276,7 +288,8 @@ def pct_changes(series: pd.Series, cap: float = None, week_n: int = 5, month_n: 
     chg_1d = chg(1)
     suspect = cap is not None and chg_1d is not None and abs(chg_1d) > cap
     return {"last": last, "chg_1d": (None if suspect else chg_1d),
-            "chg_1w": chg(week_n), "chg_1m": chg(month_n), "suspect_1d": suspect}
+            "chg_1w": chg(week_n), "chg_1m": chg(month_n), "suspect_1d": suspect,
+            "sigma": daily_sigma(s)}
 
 
 def bps_changes(series: pd.Series):
@@ -291,16 +304,36 @@ def bps_changes(series: pd.Series):
     return {"last": last, "chg_1d": chg(1), "chg_1w": chg(5), "chg_1m": chg(21)}
 
 
+def daily_sigma(series: pd.Series, window: int = 63):
+    """Standard deviation of recent daily percent returns.
+
+    Gives every threshold a unit that scales with how volatile the series
+    actually is, so the same rule can be applied to the credit ratio and to
+    crypto without meaning wildly different things.
+    """
+    s = series.dropna()
+    if len(s) < 12:
+        return None
+    rets = s.tail(window).pct_change().dropna() * 100
+    sd = float(rets.std())
+    return sd if sd > 0 else None
+
+
 def level_status(series: pd.Series, month_window: int = 21, year_window: int = 252,
-                  near_pct: float = NEAR_52W_PCT):
-    """1-month high/low (informational) and 52-week near/breach (breach only
-    is flag-worthy) — applied the same way across every group."""
+                  range_frac: float = NEAR_52W_RANGE_FRAC):
+    """1-month high/low (informational) and 52-week near/breach.
+
+    "Near" is a position within the 52-week range rather than a fixed
+    percentage of price: a series sitting in the top `range_frac` of its own
+    high-low band is near its high. That keeps the test comparable across a
+    credit ratio that moves 2% a year and a coin that moves 100%.
+    """
     s = series.dropna()
     if len(s) < 6:
         return None
     last = s.iloc[-1]
     mw = s.tail(min(month_window, len(s)))
-    result = {"month": None, "year": None, "have_year": False}
+    result = {"month": None, "year": None, "have_year": False, "range_pos": None}
     if last >= mw.max():
         result["month"] = "high"
     elif last <= mw.min():
@@ -310,13 +343,16 @@ def level_status(series: pd.Series, month_window: int = 21, year_window: int = 2
     if have_year:
         yw = s.tail(min(year_window, len(s)))
         y_max, y_min = float(yw.max()), float(yw.min())
+        span = y_max - y_min
+        if span > 0:
+            result["range_pos"] = (last - y_min) / span
         if last >= y_max:
             result["year"] = "breach_high"
         elif last <= y_min:
             result["year"] = "breach_low"
-        elif y_max > 0 and last >= y_max * (1 - near_pct / 100):
+        elif span > 0 and result["range_pos"] >= 1 - range_frac:
             result["year"] = "near_high"
-        elif y_min > 0 and last <= y_min * (1 + near_pct / 100):
+        elif span > 0 and result["range_pos"] <= range_frac:
             result["year"] = "near_low"
     return result
 
@@ -333,6 +369,37 @@ def fmt_bps(x):
 
 def is_unusual(chg_1d_pct):
     return chg_1d_pct is not None and abs(chg_1d_pct) >= UNUSUAL_MOVE_PCT
+
+
+def z_score(chg_pct, sigma):
+    """Today's move expressed in the series' own daily standard deviations."""
+    if chg_pct is None or not sigma:
+        return None
+    return abs(chg_pct) / sigma
+
+
+def is_flat(chg_pct, sigma):
+    """True when a move is too small to deserve a direction word."""
+    if chg_pct is None:
+        return True
+    if not sigma:
+        return abs(chg_pct) < 0.05
+    return abs(chg_pct) < FLAT_SIGMA_FRAC * sigma
+
+
+def flag(red_flags, text, severity):
+    """Record a red flag with a severity so the list can be ranked.
+
+    Severity is in daily-sigma units where the signal has a magnitude, and a
+    hand-set score for structural signals (curve inversion, backwardation)
+    that have no natural one. Without this every flag ranked equally, so a
+    0.5% drift to a marginal new high sat level with a 4% move in crude.
+    """
+    red_flags.append({"text": text, "severity": float(severity)})
+
+
+def severity_tier(sev):
+    return "high" if sev >= 3 else ("moderate" if sev >= 1.5 else "low")
 
 
 def base_layout(fig, height, legend=True, y_range=None):
@@ -416,31 +483,47 @@ def render_yield_box(label, value_pct, delta_bps, as_of, intraday_val, intraday_
 
 
 def collect_level_notes(rows, group_key, flagged, red_flags, big_picture):
-    """rows: list of dicts each with 'name' and 'level' (output of level_status)."""
+    """rows: dicts with 'name', 'level' (from level_status) and optionally
+    'chg_1d'/'sigma', used to size how emphatic a 52-week breach really is.
+
+    A 52-week signal implies the 1-month one, so only the stronger of the two
+    is reported — the narrative used to say both about the same asset.
+    """
+    band = f"{NEAR_52W_RANGE_FRAC * 100:.0f}%"
     for r in rows:
         ls = r.get("level")
         name = r["name"]
         if not ls:
             continue
-        if ls["month"] == "high":
-            big_picture.append(f"{name} is at a 1-month high")
-        elif ls["month"] == "low":
-            big_picture.append(f"{name} is at a 1-month low")
         year = ls.get("year")
+        # The comparison is inclusive, so this fires on matching the prior
+        # extreme as well as exceeding it — "is at" is true in both cases,
+        # where "just broke out to a fresh high" would not be.
         if year == "breach_high":
-            msg = f"{name} just broke out to a fresh 52-week high"
-            big_picture.append(msg)
-            red_flags.append(msg + ".")
-            flagged[group_key] = True
+            msg = f"{name} is at a 52-week high"
         elif year == "breach_low":
-            msg = f"{name} just broke down to a fresh 52-week low"
-            big_picture.append(msg)
-            red_flags.append(msg + ".")
-            flagged[group_key] = True
+            msg = f"{name} is at a 52-week low"
         elif year == "near_high":
-            big_picture.append(f"{name} is trading within {NEAR_52W_PCT:.0f}% of its 52-week high")
+            big_picture.append(f"{name} is in the top {band} of its 52-week range")
+            continue
         elif year == "near_low":
-            big_picture.append(f"{name} is trading within {NEAR_52W_PCT:.0f}% of its 52-week low")
+            big_picture.append(f"{name} is in the bottom {band} of its 52-week range")
+            continue
+        else:
+            if ls["month"] == "high":
+                big_picture.append(f"{name} is at a 1-month high")
+            elif ls["month"] == "low":
+                big_picture.append(f"{name} is at a 1-month low")
+            continue
+
+        # A breach carries only as much weight as the move that produced it.
+        z = z_score(r.get("chg_1d"), r.get("sigma"))
+        big_picture.append(msg)
+        if z is None:
+            flag(red_flags, msg + ".", 1.5)
+        else:
+            flag(red_flags, f"{msg} (on a {abs(r['chg_1d']):.1f}% move, {z:.1f}σ).", z)
+        flagged[group_key] = True
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +554,7 @@ if FRED_API_KEY:
                               slope_10s2s=slope_10s2s, slope_30s10s=slope_30s10s,
                               trend_10s2s=trend_10s2s, as_of=as_of_10, as_of_2=as_of_2, as_of_30=as_of_30)
         if slope_10s2s < 0:
-            red_flags.append(f"2s10s curve is inverted ({slope_10s2s:.0f} bps).")
+            flag(red_flags, f"2s10s curve is inverted ({slope_10s2s:.0f} bps).", 3.5)
             flagged["rates"] = True
         if trend_10s2s:
             notes.append(f"the 2s10s curve is {trend_10s2s} ({slope_10s2s:.0f} bps)")
@@ -507,7 +590,9 @@ if fut_rows:
         notes.append(f"equity futures show {'broad, aligned' if dispersion < 0.5 else 'narrow, divergent'} "
                      f"participation ({leader['name']} leading, {laggard['name']} lagging)")
         if dispersion >= 1.0:
-            red_flags.append(f"Wide dispersion across index futures ({dispersion:.1f} pts).")
+            flag(red_flags,
+                 f"Wide dispersion across index futures ({dispersion:.1f} percentage points).",
+                 dispersion / 0.5)
             flagged["futures"] = True
     collect_level_notes(fut_rows, "futures", flagged, red_flags, big_picture)
 
@@ -523,7 +608,9 @@ for t, n in COMMODITIES.items():
         com_hist[n] = h.tail(22)
         com_rows.append({"name": n, **d})
         if is_unusual(d["chg_1d"]):
-            red_flags.append(f"{n} moved {d['chg_1d']:+.1f}% today (≥{UNUSUAL_MOVE_PCT:.0f}% threshold).")
+            flag(red_flags,
+                 f"{n} moved {d['chg_1d']:+.1f}% today (≥{UNUSUAL_MOVE_PCT:.0f}% threshold).",
+                 z_score(d["chg_1d"], d["sigma"]) or 2.0)
             flagged["commodities"] = True
 if com_rows:
     data["commodities"] = com_rows
@@ -541,7 +628,9 @@ for t, n in AGRO.items():
         agro_hist[n] = h.tail(22)
         agro_rows.append({"name": n, **d})
         if is_unusual(d["chg_1d"]):
-            red_flags.append(f"{n} moved {d['chg_1d']:+.1f}% today (≥{UNUSUAL_MOVE_PCT:.0f}% threshold).")
+            flag(red_flags,
+                 f"{n} moved {d['chg_1d']:+.1f}% today (≥{UNUSUAL_MOVE_PCT:.0f}% threshold).",
+                 z_score(d["chg_1d"], d["sigma"]) or 2.0)
             flagged["agro"] = True
 if agro_rows:
     data["agro"] = agro_rows
@@ -566,7 +655,7 @@ if vix_rows:
                   zip(VIX_TERM, VIX_TERM[1:]) if a in vix_levels and b in vix_levels)
     data["vix"] = dict(rows=vix_rows, ordered=ordered)
     if not ordered:
-        red_flags.append("VIX term structure is inverted/backwardated.")
+        flag(red_flags, "VIX term structure is inverted/backwardated.", 3.5)
         flagged["vix"] = True
     else:
         notes.append("the VIX term structure is in normal contango (calm)")
@@ -580,10 +669,16 @@ if dxy_hist is not None:
     d["level"] = level_status(dxy_1y) if dxy_1y is not None else None
     data["dxy"] = d
     if d["chg_1d"] is not None and abs(d["chg_1d"]) >= 0.5:
-        red_flags.append(f"Dollar Index moved {d['chg_1d']:+.2f}% today.")
+        flag(red_flags, f"Dollar Index moved {d['chg_1d']:+.2f}% today.",
+             z_score(d["chg_1d"], d["sigma"]) or 2.0)
         flagged["dxy"] = True
-    notes.append(f"the dollar is {'up' if (d['chg_1d'] or 0) >= 0 else 'down'} {abs(d['chg_1d'] or 0):.2f}% on the day")
-    collect_level_notes([{"name": "DXY", "level": d["level"]}], "dxy", flagged, red_flags, big_picture)
+    if is_flat(d["chg_1d"], d["sigma"]):
+        notes.append("the dollar is little changed on the day")
+    else:
+        notes.append(f"the dollar is {'up' if d['chg_1d'] >= 0 else 'down'} "
+                     f"{abs(d['chg_1d']):.2f}% on the day")
+    collect_level_notes([{"name": "DXY", "level": d["level"], "chg_1d": d["chg_1d"],
+                          "sigma": d["sigma"]}], "dxy", flagged, red_flags, big_picture)
 
 # --- Credit stress ---
 hyg_hist, _ = fetch_yf_history("HYG")
@@ -604,10 +699,15 @@ if hyg_hist is not None and lqd_hist is not None:
         d["level"] = None
     data["credit"] = dict(ratio=ratio, **d)
     if d["chg_1d"] is not None and d["chg_1d"] <= -0.5:
-        red_flags.append(f"Credit stress proxy (HYG/LQD) fell {d['chg_1d']:.2f}% today.")
+        flag(red_flags, f"Credit stress proxy (HYG/LQD) fell {d['chg_1d']:.2f}% today.",
+             z_score(d["chg_1d"], d["sigma"]) or 2.0)
         flagged["credit"] = True
-    notes.append(f"credit conditions ({'widening' if (d['chg_1d'] or 0) < 0 else 'stable-to-easing'})")
-    collect_level_notes([{"name": "HYG/LQD ratio", "level": d["level"]}], "credit", flagged, red_flags, big_picture)
+    if is_flat(d["chg_1d"], d["sigma"]):
+        notes.append("credit conditions are steady")
+    else:
+        notes.append(f"credit conditions are {'widening' if d['chg_1d'] < 0 else 'easing'}")
+    collect_level_notes([{"name": "HYG/LQD ratio", "level": d["level"], "chg_1d": d["chg_1d"],
+                          "sigma": d["sigma"]}], "credit", flagged, red_flags, big_picture)
 
 # --- Crypto ---
 crypto_hist = {}
@@ -621,7 +721,9 @@ for t, n in CRYPTO.items():
         crypto_hist[n] = h.tail(30)
         crypto_rows.append({"name": n, **d})
         if is_unusual(d["chg_1d"]):
-            red_flags.append(f"{n} moved {d['chg_1d']:+.1f}% today (≥{UNUSUAL_MOVE_PCT:.0f}% threshold).")
+            flag(red_flags,
+                 f"{n} moved {d['chg_1d']:+.1f}% today (≥{UNUSUAL_MOVE_PCT:.0f}% threshold).",
+                 z_score(d["chg_1d"], d["sigma"]) or 2.0)
             flagged["crypto"] = True
 if crypto_rows:
     data["crypto"] = crypto_rows
@@ -657,12 +759,12 @@ def build_narrative():
         parts.append(
             f"The 2s10s Treasury spread is at {r['slope_10s2s']:.0f} bps. "
             "Curve moves — especially inversions — have historically preceded economic slowdowns or Fed "
-            "policy pivots by several quarters, and a fresh 52-week level on any tenor is worth tracking for "
+            "policy pivots by several quarters, and a 52-week extreme on any tenor is worth tracking for "
             "follow-through rather than reacting to one print."
         )
     if flagged["futures"]:
         parts.append(
-            f"Index futures show a same-day dispersion of {data.get('futures_dispersion', 0):.2f} points between "
+            f"Index futures show a same-day dispersion of {data.get('futures_dispersion', 0):.2f} percentage points between "
             f"{data.get('futures_leader', 'the leader')} and {data.get('futures_laggard', 'the laggard')} — "
             "today's move is concentrated in a specific market segment rather than broad-based."
         )
@@ -674,7 +776,7 @@ def build_narrative():
                 "worth tracing back to a specific catalyst rather than dismissing as noise."
             )
         else:
-            parts.append("A commodity in this group just hit a fresh 52-week level — worth a closer look at the driver.")
+            parts.append("A commodity in this group is sitting at a 52-week extreme — worth a closer look at the driver.")
     if flagged["agro"]:
         moves = [f"{r['name']} {r['chg_1d']:+.1f}%" for r in data.get("agro", []) if is_unusual(r["chg_1d"])]
         if moves:
@@ -683,7 +785,7 @@ def build_narrative():
                 "bleed into food inflation and related equity sectors."
             )
         else:
-            parts.append("A grain contract just hit a fresh 52-week level — worth a closer look at the driver.")
+            parts.append("A grain contract is sitting at a 52-week extreme — worth a closer look at the driver.")
     if flagged["vix"]:
         parts.append(
             "The VIX term structure has flipped into backwardation — near-term implied volatility is pricing "
@@ -697,7 +799,7 @@ def build_narrative():
                 "today's macro calendar for a rate or data-driven catalyst."
             )
         else:
-            parts.append("The Dollar Index just hit a fresh 52-week level — worth watching for follow-through.")
+            parts.append("The Dollar Index is sitting at a 52-week extreme — worth watching for follow-through.")
     if flagged["credit"]:
         d = data["credit"]
         if d["chg_1d"] is not None and d["chg_1d"] <= -0.5:
@@ -706,13 +808,13 @@ def build_narrative():
                 "follow-through over the next few sessions rather than treating a single-day move as conclusive."
             )
         else:
-            parts.append("The HYG/LQD credit ratio just hit a fresh 52-week level — a genuine shift in relative credit risk appetite.")
+            parts.append("The HYG/LQD credit ratio is sitting at a 52-week extreme — a genuine shift in relative credit risk appetite.")
     if flagged["crypto"]:
         moves = [f"{r['name']} {r['chg_1d']:+.1f}%" for r in data.get("crypto", []) if is_unusual(r["chg_1d"])]
         if moves:
             parts.append(f"Crypto moved sharply today ({', '.join(moves)}) — treat with the usual grain of salt given crypto's baseline volatility is naturally higher than the other groups here.")
         else:
-            parts.append("BTC or ETH just hit a fresh 52-week level.")
+            parts.append("BTC or ETH is sitting at a 52-week extreme.")
     return "<br><br>".join(parts)
 
 
@@ -734,8 +836,16 @@ st.markdown("#### Market read")
 st.markdown(f"<div class='summary-box'>{build_narrative()}</div>", unsafe_allow_html=True)
 
 if red_flags:
+    # Ranked by severity so the biggest move leads, instead of whatever group
+    # happened to be computed first.
+    ranked = sorted(red_flags, key=lambda f: f["severity"], reverse=True)
+    tier_color = {"high": NEG, "moderate": ACCENT2, "low": MUTED}
     flag_html = f"<div class='summary-box' style='border-left-color:{NEG}'><b>🚩 Red flags</b><br><br>"
-    flag_html += "<br>".join(f"<span class='flag-red'>• {f}</span>" for f in red_flags)
+    flag_html += "<br>".join(
+        f"<span class='flag-red' style='color:{tier_color[severity_tier(f['severity'])]}'>"
+        f"• {f['text']}</span>" for f in ranked)
+    flag_html += (f"<div class='small-caption' style='margin-top:10px;'>Ranked by size relative to each "
+                  f"series' own daily volatility · red ≥3σ, amber ≥1.5σ, grey below</div>")
     flag_html += "</div>"
     st.markdown(flag_html, unsafe_allow_html=True)
 else:
@@ -763,7 +873,7 @@ with left:
                          width="stretch", height=145)
             st.plotly_chart(normalized_chart(fut_hist, PALETTE), width="stretch",
                              config={"displayModeBar": False})
-            st.markdown(f"<div class='small-caption'>1D dispersion: {data.get('futures_dispersion', 0):.2f} pts "
+            st.markdown(f"<div class='small-caption'>1D dispersion: {data.get('futures_dispersion', 0):.2f} pp "
                         f"&nbsp;·&nbsp; yfinance, ~15-20 min delay</div>", unsafe_allow_html=True)
         else:
             st.error("Could not load futures data.")
@@ -859,8 +969,12 @@ with right:
             st.write("")
             st.plotly_chart(level_chart(d["ratio"].tail(22), color=ACCENT3),
                              width="stretch", config={"displayModeBar": False})
-            note = "Ratio falling → high-yield underperforming IG → credit stress widening." if (d["chg_1d"] or 0) < 0 \
-                else "Ratio rising → high-yield outperforming IG → credit conditions easing."
+            if is_flat(d["chg_1d"], d["sigma"]):
+                note = "Ratio flat → high-yield and IG moving together → no signal today."
+            elif d["chg_1d"] < 0:
+                note = "Ratio falling → high-yield underperforming IG → credit stress widening."
+            else:
+                note = "Ratio rising → high-yield outperforming IG → credit conditions easing."
             st.markdown(f"<div class='small-caption'>{note}</div>", unsafe_allow_html=True)
         else:
             st.error("Could not load credit data.")
