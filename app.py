@@ -57,6 +57,16 @@ MARKET_TZ = "America/New_York"
 # its "today" figures would be yesterday's while still being labelled today.
 STALE_SESSION_LAG = 1
 
+# Two consecutive sessions should be at most this far apart in calendar days
+# (a long weekend plus a holiday). Anything wider is a hole in the feed.
+MAX_SESSION_GAP_DAYS = 5
+
+# A change over n sessions should span about n*7/5 calendar days. Allow this
+# much slack before the figure is unusable. Yahoo stopped publishing ^VIX9D,
+# ^VIX3M and ^VIX6M for 54 days in 2026, and their "1-day" change was silently
+# a 54-day change -- large, wrong, and indistinguishable from a real move.
+SPAN_SLACK_DAYS = 5
+
 # "Near" a 52-week extreme is measured against the series' own 52-week RANGE,
 # not as a fixed percentage of price. A flat 1% band treated HYG/LQD — whose
 # whole yearly range is a couple of percent — as permanently near its high,
@@ -336,19 +346,27 @@ def pct_changes(series: pd.Series, cap: float = None, week_n: int = 5, month_n: 
     s = series.dropna()
     if s.empty:
         return {"last": None, "chg_1d": None, "chg_1w": None, "chg_1m": None,
-                "suspect_1d": False, "sigma": None}
+                "suspect_1d": False, "sigma": None, "gapped": False}
     last = s.iloc[-1]
+    gapped = False
 
     def chg(n):
-        if len(s) > n and s.iloc[-1 - n] != 0:
-            return (last / s.iloc[-1 - n] - 1) * 100
-        return None
+        """None when the two observations are too far apart to mean what the
+        column header says — a hole in the feed, not a real move."""
+        nonlocal gapped
+        if len(s) <= n or s.iloc[-1 - n] == 0:
+            return None
+        span = (s.index[-1] - s.index[-1 - n]).days
+        if span > n * 7 / 5 + SPAN_SLACK_DAYS:
+            gapped = True
+            return None
+        return (last / s.iloc[-1 - n] - 1) * 100
 
     chg_1d = chg(1)
     suspect = cap is not None and chg_1d is not None and abs(chg_1d) > cap
     return {"last": last, "chg_1d": (None if suspect else chg_1d),
             "chg_1w": chg(week_n), "chg_1m": chg(month_n), "suspect_1d": suspect,
-            "sigma": daily_sigma(s)}
+            "sigma": daily_sigma(s), "gapped": gapped}
 
 
 def bps_changes(series: pd.Series):
@@ -453,7 +471,15 @@ def daily_sigma(series: pd.Series, window: int = 63):
     s = series.dropna()
     if len(s) < 12:
         return None
-    rets = s.tail(window).pct_change().dropna() * 100
+    w = s.tail(window)
+    rets = w.pct_change() * 100
+    # Only differences between genuinely consecutive sessions. A hole in the
+    # feed otherwise enters as one enormous "daily" return: ^VIX9D's 54-day
+    # gap put its sigma at 16.1% a day, which made it unflaggable.
+    spans = w.index.to_series().diff().dt.days
+    rets = rets[spans <= MAX_SESSION_GAP_DAYS].dropna()
+    if len(rets) < 10:
+        return None
     sd = float(rets.std())
     return sd if sd > 0 else None
 
@@ -670,6 +696,11 @@ def render_change_table(rows, name_header, last_fmt="{:,.2f}", height=145,
     styled = out.style.apply(paint, subset=list(headers), axis=0) \
                       .hide(axis="index")
     st.dataframe(styled, width="stretch", height=height, hide_index=True)
+    if "gapped" in df.columns and df["gapped"].any():
+        missing = ", ".join(df.loc[df["gapped"], "name"])
+        st.markdown(f"<div class='small-caption'>— for {missing}: the source series is "
+                    f"missing sessions, so a change over that window would not mean what "
+                    f"the column says. The level is current.</div>", unsafe_allow_html=True)
 
 
 def render_change_box(label, chg_pct):
@@ -768,6 +799,7 @@ red_flags = []
 notes = []
 big_picture = []
 last_bar = {}          # name -> newest session in that series, for staleness
+gapped_series = set()  # names whose history has holes, so changes are withheld
 flagged = {"rates": False, "futures": False, "commodities": False, "agro": False,
            "vix": False, "dxy": False, "credit": False, "crypto": False}
 
@@ -842,6 +874,7 @@ for t, n in FUTURES.items():
         d["level"] = level_status(h, STANDARD_CFG["month_window"], STANDARD_CFG["year_window"])
         fut_hist[label] = h.tail(22)
         last_bar[label] = h.index[-1].normalize()
+        if d.get("gapped"): gapped_series.add(label)
         fut_rows.append({"name": label, **d})
 if fut_rows:
     data["futures"] = fut_rows
@@ -878,6 +911,7 @@ for t, n in COMMODITIES.items():
         d["level"] = level_status(h)
         com_hist[n] = h.tail(22)
         last_bar[n] = h.index[-1].normalize()
+        if d.get("gapped"): gapped_series.add(n)
         com_rows.append({"name": n, **d})
         if is_unusual(d["chg_1d"], d["sigma"]):
             flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"]),
@@ -897,6 +931,7 @@ for t, n in AGRO.items():
         d["level"] = level_status(h)
         agro_hist[n] = h.tail(22)
         last_bar[n] = h.index[-1].normalize()
+        if d.get("gapped"): gapped_series.add(n)
         agro_rows.append({"name": n, **d})
         if is_unusual(d["chg_1d"], d["sigma"]):
             flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"]),
@@ -918,6 +953,7 @@ for t in VIX_TERM:
         label = t.replace("^", "")
         vix_hist[label] = h.tail(22)
         last_bar[label] = h.index[-1].normalize()
+        if d.get("gapped"): gapped_series.add(label)
         vix_rows.append({"name": label, **d})
         vix_levels[t] = d["last"]
 if vix_rows:
@@ -937,6 +973,7 @@ if dxy_hist is not None:
     d = pct_changes(dxy_hist)
     d["level"] = level_status(dxy_hist)
     last_bar["DXY"] = dxy_hist.index[-1].normalize()
+    if d.get("gapped"): gapped_series.add("DXY")
     data["dxy"] = d
     if d["chg_1d"] is not None and abs(d["chg_1d"]) >= 0.5:
         flag(red_flags, f"Dollar Index moved {d['chg_1d']:+.2f}% today.",
@@ -966,6 +1003,7 @@ if hyg_hist is not None and lqd_hist is not None:
     d = pct_changes(ratio)
     d["level"] = level_status(ratio)
     last_bar["HYG/LQD"] = ratio.index[-1].normalize()
+    if d.get("gapped"): gapped_series.add("HYG/LQD")
     data["credit"] = dict(ratio=ratio, **d)
     if d["chg_1d"] is not None and d["chg_1d"] <= -0.5:
         flag(red_flags, f"Credit stress proxy (HYG/LQD) fell {d['chg_1d']:.2f}% today.",
@@ -988,6 +1026,7 @@ for t, n in CRYPTO.items():
         d["level"] = level_status(h, CRYPTO_CFG["month_window"], CRYPTO_CFG["year_window"])
         crypto_hist[n] = h.tail(30)
         last_bar[n] = h.index[-1].normalize()
+        if d.get("gapped"): gapped_series.add(n)
         crypto_rows.append({"name": n, **d})
         if is_unusual(d["chg_1d"], d["sigma"]):
             flag(red_flags, move_phrase(n, d["chg_1d"], d["sigma"]),
@@ -1005,9 +1044,12 @@ if high_impact_soon:
     titles = ", ".join(sorted({e.get("title", "") for e in high_impact_soon}))
     notes.append(f"high-impact releases on deck this week ({titles})")
 
-# --- Data freshness ---
-# Nothing previously noticed a frozen feed: a series stuck on an old bar had
-# its stale figures reported as "today" with full confidence.
+# --- Data health ---
+# Two distinct failures. Staleness is a series frozen at an old bar. Gaps are
+# holes in the middle of an otherwise current series: every tenor of the VIX
+# term structure except ^VIX itself lost 54 days of history in 2026 while
+# still reporting a current level, so their "1-day" change was really a 54-day
+# change. The last-bar check cannot see that, because the last bar is fine.
 stale_names = staleness(last_bar, always_on=set(CRYPTO.values()))
 data["stale"] = stale_names
 if stale_names:
@@ -1016,6 +1058,17 @@ if stale_names:
          f"{'is' if len(stale_names) == 1 else 'are'} behind the rest of the board; "
          f"the 1-day figures shown for them are not today's.", 3.0)
     notes.append(f"note that {', '.join(stale_names)} did not report a fresh bar")
+
+gapped_names = sorted(gapped_series)
+data["gapped"] = gapped_names
+if gapped_names:
+    flag(red_flags,
+         f"Feed gaps — {', '.join(gapped_names)} "
+         f"{'is' if len(gapped_names) == 1 else 'are'} missing sessions, so the "
+         f"affected change columns are withheld rather than shown over the wrong "
+         f"window. Levels are current.", 2.5)
+    notes.append(f"{', '.join(gapped_names)} {'has' if len(gapped_names) == 1 else 'have'} "
+                 f"gaps in the source data, so their changes are withheld")
 
 
 # ---------------------------------------------------------------------------

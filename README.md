@@ -57,6 +57,13 @@ and a coin that moves 65%.
   series rebuilt to end on the true current price.
 - **Noise band** — changes at or inside ±0.05% are greyed rather than coloured,
   so a −0.02% tick does not read as a meaningful down day.
+- **Feed gaps** — every change is checked against the calendar distance it
+  actually spans. If the source is missing sessions, the figure is withheld
+  rather than shown over the wrong window, and σ is computed only from
+  genuinely consecutive sessions. Levels are still shown, since they are
+  current. This is not hypothetical: Yahoo stopped publishing `^VIX9D`,
+  `^VIX3M` and `^VIX6M` for 54 days in 2026 while continuing to report a
+  current level, so their "1-day" change was really a 54-day change.
 - **Stale data** — any series whose newest bar lags the rest of the board by a
   session is called out, so old figures are never presented as today's.
 
