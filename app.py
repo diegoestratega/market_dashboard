@@ -1097,16 +1097,12 @@ SESSION_WORD = session_word(SESSION_DATE)
 PRE_SESSION = SESSION_DATE is not None and SESSION_DATE < market_today()
 data["session_date"], data["pre_session"] = SESSION_DATE, PRE_SESSION
 
-gapped_names = sorted(gapped_series)
-data["gapped"] = gapped_names
-if gapped_names:
-    flag(red_flags,
-         f"Feed gaps — {', '.join(gapped_names)} "
-         f"{'is' if len(gapped_names) == 1 else 'are'} missing sessions, so the "
-         f"affected change columns are withheld rather than shown over the wrong "
-         f"window. Levels are current.", 2.5)
-    notes.append(f"{', '.join(gapped_names)} {'has' if len(gapped_names) == 1 else 'have'} "
-                 f"gaps in the source data, so their changes are withheld")
+# Deliberately not a red flag or a narrative note. A hole in someone else's
+# history is a standing condition, not news — it would fire identically every
+# day for as long as the gap exists, which is the alert fatigue the ranked
+# flags exist to avoid. The affected card says which series are withheld, at
+# the point where the missing figures actually are.
+data["gapped"] = sorted(gapped_series)
 
 
 # ---------------------------------------------------------------------------
