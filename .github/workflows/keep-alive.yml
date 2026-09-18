@@ -1,0 +1,70 @@
+name: Keep Streamlit app awake
+
+# Streamlit Community Cloud hibernates an app that gets no traffic for 12 hours.
+# This opens a real browser session against the deployment on a schedule, which
+# resets that clock and also tells us the dashboard still renders.
+#
+# Schedule: every 11 hours -> 00:00, 11:00 and 22:00 UTC (largest gap 11h).
+# That leaves only ~1h of margin under the 12h sleep threshold, and GitHub's
+# scheduled runs are routinely delayed under load. Changing */11 to */6 below
+# costs nothing on a public repo and removes that risk.
+
+on:
+  schedule:
+    - cron: '0 */11 * * *'
+  workflow_dispatch:
+
+# Needed only by the heartbeat step at the end.
+permissions:
+  contents: write
+
+concurrency:
+  group: keep-alive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APP_URL: https://marketdash1.streamlit.app/
+      HOLD_SECONDS: '25'
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v5
+
+      - name: Install Playwright
+        run: |
+          python3 -m pip install --upgrade pip
+          # Pinned, same reasoning as requirements.txt: an unpinned bump here
+          # could break the ping with no change on our side.
+          python3 -m pip install 'playwright==1.56.0'
+          python3 -m playwright install --with-deps chromium
+
+      - name: Wake the app and verify it renders
+        run: python3 .github/scripts/keep_alive.py
+
+      # GitHub automatically disables scheduled workflows in a public repo after
+      # 60 days with no repository activity, which would silently kill this whole
+      # job. A commit every ~50 quiet days resets that clock. Runs even when the
+      # ping above failed, so an app outage cannot also cost us the schedule.
+      - name: Heartbeat commit if the repo has been quiet
+        if: always()
+        run: |
+          set -euo pipefail
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          days=$(( (now - last) / 86400 ))
+          echo "Days since last commit: ${days}"
+          if [ "${days}" -ge 50 ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/keep-alive-heartbeat.txt
+            git config user.name  'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add .github/keep-alive-heartbeat.txt
+            git commit -m 'chore: keep-alive heartbeat so GitHub does not disable the schedule'
+            git push
+            echo "Heartbeat pushed."
+          else
+            echo "Repo active recently enough - no heartbeat needed."
+          fi
