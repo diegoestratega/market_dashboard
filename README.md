@@ -55,6 +55,16 @@ and a coin that moves 65%.
   phantom move. On a roll day (third Friday of Mar/Jun/Sep/Dec) the contract's
   economic return is the cash index's return, so it is substituted and the
   series rebuilt to end on the true current price.
+- **Commodities and grains are roll-adjusted too.** These roll on their own
+  schedules with no cash index to anchor to, so a continuously traded ETF
+  (USO, GLD, SLV, CPER, WEAT, CORN, SOYB) is the reference. Divergence from the
+  proxy alone is not proof of a roll — over two years it flagged 95 days across
+  seven contracts of which only 35 were real — so history is judged on whether
+  the futures/proxy ratio takes a *persistent* step, since tracking noise
+  reverts. On the newest bar the two are inseparable, so that one is settled by
+  checking the contracts themselves: if the last two closes belong to different
+  delivery months, the move between them is the calendar spread and the held
+  contract's own return is used instead.
 - **Noise band** — changes at or inside ±0.05% are greyed rather than coloured,
   so a −0.02% tick does not read as a meaningful down day.
 - **Feed gaps** — every change is checked against the calendar distance it

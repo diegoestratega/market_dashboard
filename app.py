@@ -101,6 +101,27 @@ ROLL_MONTHS = (3, 6, 9, 12)
 ROLL_WINDOW_DAYS = 4
 ROLL_DIVERGENCE_PP = 0.75
 
+# Commodity and grain contracts roll on their own schedules, so there is no
+# date window to gate on and no cash index to anchor to. A continuously traded
+# ETF stands in as the reference instead.
+COMMODITY_PROXY = {"CL=F": "USO", "GC=F": "GLD", "SI=F": "SLV", "HG=F": "CPER",
+                   "ZW=F": "WEAT", "ZC=F": "CORN", "ZS=F": "SOYB"}
+
+# Divergence from the proxy alone is NOT sufficient evidence of a roll: over
+# two years it flagged 95 days across these seven contracts, of which only 35
+# were real. A roll is a PERSISTENT step in the futures/proxy ratio, where
+# tracking noise reverts, so history is judged on that. Measured on the
+# current bar the two are inseparable (noise reaches 22.9% against a median
+# roll of 3.1%), so today is settled by looking at the contracts themselves.
+ROLL_PROXY_DIVERGENCE_PP = 2.0
+ROLL_PERSIST_STEP_PCT = 1.5
+ROLL_PERSIST_WINDOW = 5
+
+MONTH_CODES = "FGHJKMNQUVXZ"
+FUTURES_ROOTS = {"CL=F": ("CL", "NYM"), "GC=F": ("GC", "CMX"), "SI=F": ("SI", "CMX"),
+                 "HG=F": ("HG", "CMX"), "ZW=F": ("ZW", "CBT"), "ZC=F": ("ZC", "CBT"),
+                 "ZS=F": ("ZS", "CBT")}
+
 # Live yield proxies. Yahoo publishes intraday indices for the 5Y, 10Y and 30Y
 # but has nothing for the 2Y: ^UST2Y/^US2Y do not exist, and 2YY=F (CBOT 2-Year
 # Yield futures) is too thinly quoted to use — one 15-minute bar in five days,
@@ -428,6 +449,94 @@ def backadjust_rolls(fut: pd.Series, cash: pd.Series):
     growth = (1 + adj).cumprod()
     rebuilt = growth / growth.iloc[-1] * float(j["f"].iloc[-1])
     return rebuilt, int(rolls.sum())
+
+
+def contract_symbols(root, exchange, count=6, start=None):
+    """The next few listed months for a futures root, Yahoo style (CLX26.NYM).
+
+    Months a contract does not trade simply return no data and are skipped,
+    which is cheaper than encoding each product's delivery cycle.
+    """
+    d = start or dt.date.today()
+    out = []
+    for k in range(count):
+        m0 = d.month - 1 + k
+        year, month = d.year + m0 // 12, m0 % 12
+        out.append(f"{root}{MONTH_CODES[month]}{year % 100:02d}.{exchange}")
+    return out
+
+
+def confirm_roll(front: pd.Series, ticker: str):
+    """Did the continuous series change contract on its most recent bar?
+
+    Definitive where the proxy test is not: if the last two closes belong to
+    two different delivery months, the move between them is the calendar
+    spread, not a price change. Returns the return of the contract actually
+    held into the roll, which is the real move for that session.
+    """
+    roots = FUTURES_ROOTS.get(ticker)
+    if roots is None or len(front) < 2:
+        return None
+    root, exchange = roots
+    today_v, prev_v = float(front.iloc[-1]), float(front.iloc[-2])
+    held = matched_today = None
+    for sym in contract_symbols(root, exchange):
+        c, _ = fetch_yf_history(sym, period="1mo")
+        if c is None or len(c) < 2:
+            continue
+        if abs(float(c.iloc[-1]) - today_v) < 1e-6:
+            matched_today = sym
+        if abs(float(c.iloc[-2]) - prev_v) < 1e-6:
+            held = (sym, c)
+    if held and matched_today and held[0] != matched_today:
+        hc = held[1]
+        return (float(hc.iloc[-1]) / float(hc.iloc[-2]) - 1) * 100
+    return None
+
+
+def backadjust_proxy_rolls(fut: pd.Series, proxy: pd.Series, ticker: str):
+    """Remove contract-roll steps from a commodity or grain series.
+
+    History is judged by persistence — a roll leaves a permanent step in the
+    futures/proxy ratio, tracking noise reverts within days. The most recent
+    bars have no "after" window to test, so the latest one is settled against
+    the contracts themselves and the rest are left alone rather than guessed.
+    """
+    if fut is None or proxy is None or fut.empty or proxy.empty:
+        return fut, 0, None
+    j = pd.concat([fut.rename("f"), proxy.rename("p")], axis=1, join="inner").dropna()
+    if len(j) < 40:
+        return fut, 0, None
+    ratio = j["f"] / j["p"]
+    div = (j["f"].pct_change() - j["p"].pct_change()).abs() * 100
+    rets = j["f"].pct_change()
+    w = ROLL_PERSIST_WINDOW
+    rolls = pd.Series(False, index=j.index)
+    for i in range(w, len(j) - w):
+        if div.iloc[i] <= ROLL_PROXY_DIVERGENCE_PP:
+            continue
+        before = ratio.iloc[i - w:i].median()
+        after = ratio.iloc[i + 1:i + 1 + w].median()
+        if before and abs(after / before - 1) * 100 > ROLL_PERSIST_STEP_PCT:
+            rolls.iloc[i] = True
+
+    # The newest bar: only the contracts can settle it.
+    live_roll_return = None
+    if div.iloc[-1] > ROLL_PROXY_DIVERGENCE_PP:
+        live_roll_return = confirm_roll(j["f"], ticker)
+        if live_roll_return is not None:
+            rolls.iloc[-1] = True
+            rets.iloc[-1] = live_roll_return / 100
+
+    if not rolls.any():
+        return fut, 0, None
+    adj = rets.where(~rolls, j["p"].pct_change())
+    if live_roll_return is not None:
+        adj.iloc[-1] = live_roll_return / 100      # the held contract's own move
+    adj = adj.fillna(0)
+    growth = (1 + adj).cumprod()
+    rebuilt = growth / growth.iloc[-1] * float(j["f"].iloc[-1])
+    return rebuilt, int(rolls.sum()), live_roll_return
 
 
 def estimate_live_2y(fred_2y, fvx_daily, fvx_live):
@@ -884,6 +993,7 @@ live_yield["2Y"] = {
 fut_hist = {}
 fut_rows = []
 rolls_removed = 0
+rolled_today = set()
 for t, n in FUTURES.items():
     h, label, used_ticker = fetch_future_with_fallback(t, n)
     if h is not None:
@@ -931,6 +1041,11 @@ com_rows = []
 for t, n in COMMODITIES.items():
     h, _ = fetch_yf_history(t)
     if h is not None:
+        proxy, _ = fetch_yf_history(COMMODITY_PROXY[t]) if t in COMMODITY_PROXY else (None, None)
+        h, n_rolls, live_roll = backadjust_proxy_rolls(h, proxy, t)
+        rolls_removed += n_rolls
+        if live_roll is not None:
+            rolled_today.add(n)
         d = pct_changes(h)
         d["level"] = level_status(h)
         com_hist[n] = h.tail(22)
@@ -952,6 +1067,11 @@ agro_rows = []
 for t, n in AGRO.items():
     h, _ = fetch_yf_history(t)
     if h is not None:
+        proxy, _ = fetch_yf_history(COMMODITY_PROXY[t]) if t in COMMODITY_PROXY else (None, None)
+        h, n_rolls, live_roll = backadjust_proxy_rolls(h, proxy, t)
+        rolls_removed += n_rolls
+        if live_roll is not None:
+            rolled_today.add(n)
         d = pct_changes(h)
         d["level"] = level_status(h)
         agro_hist[n] = h.tail(22)
@@ -1299,6 +1419,10 @@ with left:
                              config={"displayModeBar": False})
             st.markdown(f"<div class='small-caption'>Unusual move: ≥{UNUSUAL_MOVE_SIGMA:.1f}σ of this series' own daily vol, or ≥±{UNUSUAL_MOVE_PCT:.0f}% outright</div>",
                         unsafe_allow_html=True)
+            rolled = [r['name'] for r in data['commodities'] if r['name'] in rolled_today]
+            if rolled:
+                st.markdown(f"<div class='small-caption'>{', '.join(rolled)} rolled contract today; the change shown is the held contract's own move, not the calendar spread.</div>",
+                            unsafe_allow_html=True)
         else:
             st.error("Could not load commodity data.")
 
@@ -1309,6 +1433,10 @@ with left:
                              config={"displayModeBar": False})
             st.markdown(f"<div class='small-caption'>Unusual move: ≥{UNUSUAL_MOVE_SIGMA:.1f}σ of this series' own daily vol, or ≥±{UNUSUAL_MOVE_PCT:.0f}% outright "
                         f"&nbsp;·&nbsp; CBOT futures, yfinance</div>", unsafe_allow_html=True)
+            rolled = [r['name'] for r in data['agro'] if r['name'] in rolled_today]
+            if rolled:
+                st.markdown(f"<div class='small-caption'>{', '.join(rolled)} rolled contract today; the change shown is the held contract's own move, not the calendar spread.</div>",
+                            unsafe_allow_html=True)
         else:
             st.error("Could not load agro data.")
 
