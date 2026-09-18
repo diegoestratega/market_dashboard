@@ -117,6 +117,17 @@ ROLL_PROXY_DIVERGENCE_PP = 2.0
 ROLL_PERSIST_STEP_PCT = 1.5
 ROLL_PERSIST_WINDOW = 5
 
+# Yesterday's close is settled, so the contract that was held matches it to the
+# cent; this tolerance only absorbs float representation, and is relative so it
+# behaves the same on gold at 4,400 as on corn at 4.
+SETTLED_MATCH_TOL = 1e-6
+# Today's value is matched to the NEAREST contract instead of an exact one,
+# because two live quotes are never bit-identical across separate cache fills.
+# A roll is only called when the held contract is this many times further from
+# today's value than the nearest is, so two closely spaced delivery months are
+# never separated by quote staleness alone.
+ROLL_NEAREST_RATIO = 3.0
+
 MONTH_CODES = "FGHJKMNQUVXZ"
 FUTURES_ROOTS = {"CL=F": ("CL", "NYM"), "GC=F": ("GC", "CMX"), "SI=F": ("SI", "CMX"),
                  "HG=F": ("HG", "CMX"), "ZW=F": ("ZW", "CBT"), "ZC=F": ("ZC", "CBT"),
@@ -473,25 +484,49 @@ def confirm_roll(front: pd.Series, ticker: str):
     two different delivery months, the move between them is the calendar
     spread, not a price change. Returns the return of the contract actually
     held into the roll, which is the real move for that session.
+
+    The held contract is identified on yesterday's close, which is settled and
+    therefore matches exactly. Today's value cannot be matched the same way:
+    the continuous series and each contract arrive through fetch_yf_history's
+    20-minute cache on independent clocks, so two live quotes for the SAME
+    instrument differ by whatever the market did between the two fills. An
+    equality test there only holds while every fetch sits in one cache
+    generation, so the adjustment fired on a cold start and silently vanished
+    as the entries expired apart. Today's contract is the NEAREST one instead,
+    which a calendar spread wins by orders of magnitude over staleness.
     """
     roots = FUTURES_ROOTS.get(ticker)
     if roots is None or len(front) < 2:
         return None
     root, exchange = roots
     today_v, prev_v = float(front.iloc[-1]), float(front.iloc[-2])
-    held = matched_today = None
+
+    held = None
+    quotes = []
     for sym in contract_symbols(root, exchange):
         c, _ = fetch_yf_history(sym, period="1mo")
         if c is None or len(c) < 2:
             continue
-        if abs(float(c.iloc[-1]) - today_v) < 1e-6:
-            matched_today = sym
-        if abs(float(c.iloc[-2]) - prev_v) < 1e-6:
+        quotes.append((sym, c))
+        if abs(float(c.iloc[-2]) - prev_v) <= SETTLED_MATCH_TOL * max(abs(prev_v), 1.0):
             held = (sym, c)
-    if held and matched_today and held[0] != matched_today:
-        hc = held[1]
-        return (float(hc.iloc[-1]) / float(hc.iloc[-2]) - 1) * 100
-    return None
+    if held is None or not quotes:
+        return None
+
+    nearest = min(quotes, key=lambda q: abs(float(q[1].iloc[-1]) - today_v))
+    if nearest[0] == held[0]:
+        return None
+
+    # The held contract has to be clearly further from today's value than the
+    # nearest is, not further by a tick, or two adjacent deliveries trading a
+    # few cents apart could be told apart by staleness alone.
+    d_near = abs(float(nearest[1].iloc[-1]) - today_v)
+    d_held = abs(float(held[1].iloc[-1]) - today_v)
+    if d_held < ROLL_NEAREST_RATIO * d_near:
+        return None
+
+    hc = held[1]
+    return (float(hc.iloc[-1]) / float(hc.iloc[-2]) - 1) * 100
 
 
 def backadjust_proxy_rolls(fut: pd.Series, proxy: pd.Series, ticker: str):
