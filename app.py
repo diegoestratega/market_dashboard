@@ -482,8 +482,8 @@ def confirm_roll(front: pd.Series, ticker: str):
 
     Definitive where the proxy test is not: if the last two closes belong to
     two different delivery months, the move between them is the calendar
-    spread, not a price change. Returns the return of the contract actually
-    held into the roll, which is the real move for that session.
+    spread, not a price change. Returns the incoming contract's own return,
+    which is the current front month and the live market for that session.
 
     The held contract is identified on yesterday's close, which is settled and
     therefore matches exactly. Today's value cannot be matched the same way:
@@ -525,8 +525,13 @@ def confirm_roll(front: pd.Series, ticker: str):
     if d_held < ROLL_NEAREST_RATIO * d_near:
         return None
 
-    hc = held[1]
-    return (float(hc.iloc[-1]) / float(hc.iloc[-2]) - 1) * 100
+    # The INCOMING contract's own move, not the outgoing one's. The contract
+    # being rolled out of is in its final session and thinly traded: on the
+    # 2026-09-22 crude roll it printed -0.6% against -3.2% for the incoming
+    # front month, with USO at -3.4% and Brent at -1.9%. The incoming contract
+    # is both the current front month and the more representative print.
+    nc = nearest[1]
+    return (float(nc.iloc[-1]) / float(nc.iloc[-2]) - 1) * 100
 
 
 def backadjust_proxy_rolls(fut: pd.Series, proxy: pd.Series, ticker: str):
@@ -572,6 +577,53 @@ def backadjust_proxy_rolls(fut: pd.Series, proxy: pd.Series, ticker: str):
     growth = (1 + adj).cumprod()
     rebuilt = growth / growth.iloc[-1] * float(j["f"].iloc[-1])
     return rebuilt, int(rolls.sum()), live_roll_return
+
+
+def live_yield_series(daily: pd.Series, live_value):
+    """Daily yield history with the current quote standing in as today's point.
+
+    The 52-week test and the change columns run on this rather than on FRED,
+    so a level flag describes where the yield is now rather than where it
+    settled last. Yahoo's indices track FRED to well under a basis point
+    (level correlation 0.999, mean difference under half a bp) and carry
+    sessions FRED has not published yet.
+    """
+    if daily is None or daily.empty:
+        return None
+    s = daily.copy()
+    if live_value is None:
+        return s
+    today, last = market_today(), s.index[-1]
+    if last >= today or today.weekday() >= 5:
+        # Today's session is already in the file, or it is the weekend and the
+        # quote is the last session's closing tick — refine that point rather
+        # than inventing a Saturday bar, which would have made the 1-day
+        # change read zero over a weekend.
+        s.iloc[-1] = float(live_value)
+    else:
+        s.loc[today] = float(live_value)
+        s = s.sort_index()
+        s = s[~s.index.duplicated(keep="last")]
+    return s
+
+
+def carry_forward_2y(fred_2y, fvx_daily, beta=TWO_YEAR_BETA_ON_5Y):
+    """A 2Y history that reaches today, since no live 2Y index exists.
+
+    FRED's own series up to its last settle, then extended by the 5Y's moves
+    scaled by beta — the same relationship the headline estimate uses, applied
+    across every session FRED has not published.
+    """
+    if fred_2y is None or fvx_daily is None or fred_2y.empty or fvx_daily.empty:
+        return fred_2y
+    settle = fred_2y.index[-1].normalize()
+    anchor = fvx_daily[fvx_daily.index.normalize() <= settle]
+    later = fvx_daily[fvx_daily.index.normalize() > settle]
+    if anchor.empty or later.empty:
+        return fred_2y
+    extension = float(fred_2y.iloc[-1]) + beta * (later - float(anchor.iloc[-1]))
+    out = pd.concat([fred_2y, extension]).sort_index()
+    return out[~out.index.duplicated(keep="last")]
 
 
 def estimate_live_2y(fred_2y, fvx_daily, fvx_live):
@@ -887,7 +939,8 @@ def render_change_box(label, chg_pct):
             f"<div class='yield-label'>{label}</div>{body}</div>")
 
 
-def render_yield_box(label, live_val, live_ts, settled_val, settled_as_of, estimated=False):
+def render_yield_box(label, live_val, live_ts, chg_bps, settled_val, settled_as_of,
+                     estimated=False):
     """Lead with the freshest number available, not the settled one.
 
     FRED publishes a day in arrears, so the old layout put a stale figure in
@@ -896,9 +949,12 @@ def render_yield_box(label, live_val, live_ts, settled_val, settled_as_of, estim
     and the settled value is demoted to the sub-line for reference.
     """
     if live_val is not None:
-        move = (live_val - settled_val) * 100 if settled_val is not None else None
+        # The chip is the session's own move on the live series, not the gap to
+        # FRED's settle — that gap grows with FRED's publication lag and said
+        # nothing about today.
+        move = chg_bps
         cls = "yield-delta-pos" if (move or 0) >= 0 else "yield-delta-neg"
-        chip = f"<span class='yield-delta {cls}'>{fmt_bps(move)}</span>" if move is not None else ""
+        chip = f"<span class='yield-delta {cls}'>{fmt_bps(move)}</span>" if not _missing(move) else ""
         tag = " · est" if estimated else ""
         head = f"{live_val:.2f}%{chip}"
         sub = f"{live_ts}{tag}"
@@ -972,57 +1028,57 @@ flagged = {"rates": False, "futures": False, "commodities": False, "agro": False
            "vix": False, "dxy": False, "credit": False, "crypto": False}
 
 # --- Rates ---
+# Live quotes first: the whole card, including the 52-week test and the change
+# columns, is built on them. FRED stays as the settled reference and supplies
+# the 2Y anchor, but it publishes a business day or more in arrears, so a
+# level flag computed on it described a yield that had since moved.
+live_yield, yahoo_yield_daily = {}, {}
+for tenor, tk in LIVE_YIELD_TICKERS.items():
+    val, ts = fetch_intraday_quote(tk)
+    live_yield[tenor] = {"value": val, "ts": ts}
+    yahoo_yield_daily[tenor], _ = fetch_yf_history(tk)
+
 if FRED_API_KEY:
-    y2, as_of_2 = fetch_fred_series("DGS2")
-    y5, as_of_5 = fetch_fred_series("DGS5")
-    y10, as_of_10 = fetch_fred_series("DGS10")
-    y30, as_of_30 = fetch_fred_series("DGS30")
-    if y2 is not None and y10 is not None and y30 is not None:
-        c2, c10, c30 = bps_changes(y2), bps_changes(y10), bps_changes(y30)
-        c5 = bps_changes(y5) if y5 is not None else None
-        slope_10s2s = (y10.iloc[-1] - y2.iloc[-1]) * 100
-        slope_30s10s = (y30.iloc[-1] - y10.iloc[-1]) * 100
-        slope_10s2s_1d = (y10.iloc[-2] - y2.iloc[-2]) * 100 if len(y10) > 1 and len(y2) > 1 else None
-        trend_10s2s = None
-        if slope_10s2s_1d is not None:
-            trend_10s2s = "steepening" if slope_10s2s > slope_10s2s_1d else "flattening"
-        data["rates"] = dict(y2=y2, y5=y5, y10=y10, y30=y30, c2=c2, c5=c5, c10=c10, c30=c30,
-                              slope_10s2s=slope_10s2s, slope_30s10s=slope_30s10s,
-                              trend_10s2s=trend_10s2s, as_of=as_of_10, as_of_2=as_of_2,
-                              as_of_5=as_of_5, as_of_30=as_of_30)
+    y2_settled, as_of_2 = fetch_fred_series("DGS2")
+    y5_settled, as_of_5 = fetch_fred_series("DGS5")
+    y10_settled, as_of_10 = fetch_fred_series("DGS10")
+    y30_settled, as_of_30 = fetch_fred_series("DGS30")
+
+    est_2y = estimate_live_2y(y2_settled, yahoo_yield_daily.get("5Y"),
+                              live_yield["5Y"]["value"])
+    live_yield["2Y"] = {"value": est_2y, "ts": live_yield["5Y"]["ts"], "estimated": True}
+
+    Y = {"2Y": live_yield_series(carry_forward_2y(y2_settled, yahoo_yield_daily.get("5Y")), est_2y),
+         "5Y": live_yield_series(yahoo_yield_daily.get("5Y"), live_yield["5Y"]["value"]),
+         "10Y": live_yield_series(yahoo_yield_daily.get("10Y"), live_yield["10Y"]["value"]),
+         "30Y": live_yield_series(yahoo_yield_daily.get("30Y"), live_yield["30Y"]["value"])}
+
+    if all(Y.get(t) is not None and not Y[t].empty for t in ("2Y", "10Y", "30Y")):
+        C = {t: bps_changes(v) for t, v in Y.items() if v is not None}
+        slope_10s2s = (Y["10Y"].iloc[-1] - Y["2Y"].iloc[-1]) * 100
+        slope_30s10s = (Y["30Y"].iloc[-1] - Y["10Y"].iloc[-1]) * 100
+        prev = ((Y["10Y"].iloc[-2] - Y["2Y"].iloc[-2]) * 100
+                if len(Y["10Y"]) > 1 and len(Y["2Y"]) > 1 else None)
+        trend_10s2s = None if prev is None else (
+            "steepening" if slope_10s2s > prev else "flattening")
+        settled = {"2Y": (y2_settled, as_of_2), "5Y": (y5_settled, as_of_5),
+                   "10Y": (y10_settled, as_of_10), "30Y": (y30_settled, as_of_30)}
+        data["rates"] = dict(Y=Y, C=C, settled=settled, slope_10s2s=slope_10s2s,
+                             slope_30s10s=slope_30s10s, trend_10s2s=trend_10s2s)
+        for t, v in Y.items():
+            if v is not None and not v.empty:
+                last_bar[t + " yield"] = v.index[-1].normalize()
         if slope_10s2s < 0:
             flag(red_flags, f"2s10s curve is inverted ({slope_10s2s:.0f} bps).", 3.5)
             flagged["rates"] = True
         if trend_10s2s:
             notes.append(f"the 2s10s curve is {trend_10s2s} ({slope_10s2s:.0f} bps)")
 
-        # Yields carry their bps move and bps volatility so a 52-week level
-        # gets ranked on the same footing as everything else.
-        rate_rows = [{"name": "2Y", "level": level_status(y2),
-                      "chg_1d": c2["chg_1d"], "sigma": c2["sigma"], "unit": " bps"},
-                     {"name": "5Y", "level": level_status(y5) if y5 is not None else None,
-                      "chg_1d": c5["chg_1d"] if c5 else None,
-                      "sigma": c5["sigma"] if c5 else None, "unit": " bps"},
-                     {"name": "10Y", "level": level_status(y10),
-                      "chg_1d": c10["chg_1d"], "sigma": c10["sigma"], "unit": " bps"},
-                     {"name": "30Y", "level": level_status(y30),
-                      "chg_1d": c30["chg_1d"], "sigma": c30["sigma"], "unit": " bps"}]
+        # Level flags now describe the live yield, so they agree with the boxes.
+        rate_rows = [{"name": t, "level": level_status(Y[t]),
+                      "chg_1d": C[t]["chg_1d"], "sigma": C[t]["sigma"], "unit": " bps"}
+                     for t in ("2Y", "5Y", "10Y", "30Y") if Y.get(t) is not None]
         collect_level_notes(rate_rows, "rates", flagged, red_flags, big_picture)
-
-# Live yields. These lead the rates card; FRED is the settled reference.
-live_yield = {}
-for tenor, tk in LIVE_YIELD_TICKERS.items():
-    val, ts = fetch_intraday_quote(tk)
-    live_yield[tenor] = {"value": val, "ts": ts}
-
-# The 2Y has no live index, so carry the settle forward on the 5Y's move.
-fvx_daily, _ = fetch_yf_history(LIVE_YIELD_TICKERS["5Y"])
-live_yield["2Y"] = {
-    "value": estimate_live_2y(data.get("rates", {}).get("y2"), fvx_daily,
-                              live_yield["5Y"]["value"]),
-    "ts": live_yield["5Y"]["ts"],
-    "estimated": True,
-}
 
 # --- Index futures ---
 fut_hist = {}
@@ -1406,38 +1462,28 @@ with left:
     with card("Rates & Yield Curve", flagged["rates"]):
         if "rates" in data:
             r = data["rates"]
-            settled = {"2Y": (r["y2"].iloc[-1], r["as_of_2"]),
-                       "5Y": (r["y5"].iloc[-1], r["as_of_5"]) if r.get("y5") is not None else (None, None),
-                       "10Y": (r["y10"].iloc[-1], r["as_of"]),
-                       "30Y": (r["y30"].iloc[-1], r["as_of_30"])}
+            Y, C, settled = r["Y"], r["C"], r["settled"]
             for col, tenor in zip(st.columns(4), ["2Y", "5Y", "10Y", "30Y"]):
                 lv = live_yield.get(tenor, {})
-                s_val, s_as_of = settled[tenor]
+                s_series, s_as_of = settled.get(tenor, (None, None))
+                s_val = float(s_series.iloc[-1]) if s_series is not None and not s_series.empty else None
                 with col:
                     st.markdown(render_yield_box(tenor, lv.get("value"), lv.get("ts"),
+                                                 C.get(tenor, {}).get("chg_1d"),
                                                  s_val, s_as_of, lv.get("estimated", False)),
                                 unsafe_allow_html=True)
 
-            # Curve from the live quotes where they exist, settled alongside.
-            live_2y, live_10y = live_yield.get("2Y", {}).get("value"), live_yield.get("10Y", {}).get("value")
-            live_30y = live_yield.get("30Y", {}).get("value")
-            curve_bits = [f"10s2s: <b>{r['slope_10s2s']:.0f} bps</b> settled ({r['trend_10s2s'] or '—'})"]
-            if live_2y is not None and live_10y is not None:
-                curve_bits.append(f"~{(live_10y - live_2y) * 100:.0f} bps live (est)")
-            curve_bits.append(f"30s10s: <b>{r['slope_30s10s']:.0f} bps</b> settled")
-            if live_10y is not None and live_30y is not None:
-                curve_bits.append(f"~{(live_30y - live_10y) * 100:.0f} bps live")
             st.markdown(f"<div class='small-caption' style='margin-top:10px;'>"
-                        f"{' &nbsp;·&nbsp; '.join(curve_bits)}<br>"
-                        f"Live 5Y/10Y/30Y from ^FVX/^TNX/^TYX (~15 min delay). The 2Y has no live "
-                        f"index, so it is FRED's settle carried forward on the 5Y's move "
+                        f"10s2s: <b>{r['slope_10s2s']:.0f} bps</b> ({r['trend_10s2s'] or '—'}) "
+                        f"&nbsp;·&nbsp; 30s10s: <b>{r['slope_30s10s']:.0f} bps</b><br>"
+                        f"Levels, changes and 52-week flags all run on the live quotes "
+                        f"(^FVX/^TNX/^TYX, ~15 min delay), not on FRED's settle. The 2Y has no "
+                        f"live index, so it is carried forward on the 5Y's move "
                         f"(β={TWO_YEAR_BETA_ON_5Y}, typical error ±{TWO_YEAR_EST_ERR_BPS:.1f} bps).</div>",
                         unsafe_allow_html=True)
             st.write("")
-            chart_series = {"2Y": r["y2"].tail(66), "10Y": r["y10"].tail(66), "30Y": r["y30"].tail(66)}
-            if r.get("y5") is not None:
-                chart_series = {"2Y": r["y2"].tail(66), "5Y": r["y5"].tail(66),
-                                "10Y": r["y10"].tail(66), "30Y": r["y30"].tail(66)}
+            chart_series = {t: Y[t].tail(66) for t in ("2Y", "5Y", "10Y", "30Y")
+                            if Y.get(t) is not None}
             st.plotly_chart(multi_level_chart(chart_series, PALETTE, ticksuffix="%"),
                              width="stretch", config={"displayModeBar": False})
         else:
@@ -1456,7 +1502,7 @@ with left:
                         unsafe_allow_html=True)
             rolled = [r['name'] for r in data['commodities'] if r['name'] in rolled_today]
             if rolled:
-                st.markdown(f"<div class='small-caption'>{', '.join(rolled)} rolled contract today; the change shown is the held contract's own move, not the calendar spread.</div>",
+                st.markdown(f"<div class='small-caption'>{', '.join(rolled)} rolled contract today; the change shown is the incoming contract's own move, not the calendar spread.</div>",
                             unsafe_allow_html=True)
         else:
             st.error("Could not load commodity data.")
@@ -1470,7 +1516,7 @@ with left:
                         f"&nbsp;·&nbsp; CBOT futures, yfinance</div>", unsafe_allow_html=True)
             rolled = [r['name'] for r in data['agro'] if r['name'] in rolled_today]
             if rolled:
-                st.markdown(f"<div class='small-caption'>{', '.join(rolled)} rolled contract today; the change shown is the held contract's own move, not the calendar spread.</div>",
+                st.markdown(f"<div class='small-caption'>{', '.join(rolled)} rolled contract today; the change shown is the incoming contract's own move, not the calendar spread.</div>",
                             unsafe_allow_html=True)
         else:
             st.error("Could not load agro data.")

@@ -11,7 +11,7 @@ Live: <https://marketdash1.streamlit.app/>
 
 | Card | Source | Notes |
 |---|---|---|
-| Rates & yield curve | FRED + yfinance | Live 5Y/10Y/30Y lead the card (`^FVX`/`^TNX`/`^TYX`); FRED `DGS2/5/10/30` is the settled reference. The 2Y is estimated — see below |
+| Rates & yield curve | yfinance + FRED | Levels, changes and 52-week flags all run on the live quotes (`^FVX`/`^TNX`/`^TYX`); FRED `DGS2/5/10/30` is shown as the settled reference and anchors the 2Y. The 2Y is estimated — see below |
 | Index futures | yfinance | ES / NQ / RTY, falling back to the cash index if a contract is unavailable |
 | Oil & metals | yfinance | WTI, gold, silver, copper |
 | Agro | yfinance | CBOT wheat, corn, soybeans |
@@ -38,6 +38,12 @@ and a coin that moves 65%.
   widening or easing; below that it reads as flat.
 - **Red flags** — ranked by size relative to that series' volatility, coloured
   red ≥3σ, amber ≥1.5σ, grey below.
+- **Rates run on live quotes, not FRED's settle.** FRED publishes a business
+  day or more in arrears, so a 52-week flag computed on it described a yield
+  that had since moved — the flags said "52-week high" while the boxes showed
+  yields down. Yahoo's indices track FRED to well under a basis point (level
+  correlation 0.999, mean difference under half a bp) and carry sessions FRED
+  has not published, so they are the basis for levels, changes and flags alike.
 - **The 2Y yield is an estimate.** Yahoo publishes no live 2Y index, and
   `2YY=F` is too thinly quoted to use (one 15-minute bar in five days, 14–20 bps
   off the official yield, and a correlation of daily *changes* against it of
