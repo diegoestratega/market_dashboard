@@ -2,21 +2,24 @@ name: Keep Streamlit app awake
 
 # Streamlit Community Cloud hibernates an app that gets no traffic for 12 hours.
 # This opens a real browser session against the deployment on a schedule, which
-# resets that clock and also tells us the dashboard still renders.
+# resets that clock, wakes the app if it finds it asleep, and tells us the
+# dashboard still renders. See .github/scripts/keep_alive.py for how.
 #
 # Schedule: hourly, at minute 17 (UTC).
 #
 # This ran every 11 hours (00:00/11:00/22:00 UTC) from 2026-09-18 to 2026-10-13
-# and the app still slept every day. GitHub never created the third run - 53
-# scheduled runs in 25 days, two a day - and the ones it did create fired late:
-# the 11:00 slot landed between 15:00 and 20:03 UTC. That left a 14-19 hour
-# gap daily, past the 12h threshold, right across the US market open.
+# and the app still slept. Of 74 scheduled slots GitHub created 53 runs - from
+# Sep 23 on, only two a day - and the 11:00 slot fired between 14:02 and 20:03
+# UTC every day, 3 to 9 hours late. 22 of the 52 gaps between runs were longer
+# than 12 hours (the longest 19.2), so the app went to sleep around the US
+# market open.
 #
 # Two changes, both straight from GitHub's own guidance on schedule delays:
 #   - minute 17, not 0: the top of the hour is when scheduled runs are most
 #     delayed and most often dropped
-#   - hourly: one dropped or late run no longer opens a gap. It would take
-#     roughly a dozen consecutive misses to reach 12 hours untouched.
+#   - hourly: with runs up to 9 hours late and some skipped outright, every 2h
+#     can still leave a 13-hour gap. Hourly survives a skipped run followed by
+#     one 9 hours late. Worth re-measuring once there is data at minute 17.
 # Free on a public repo; each run is about a minute.
 
 on:
@@ -35,7 +38,9 @@ concurrency:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A cold boot after hibernation can take several minutes; the script allows
+    # up to 8 for it on top of the session check.
+    timeout-minutes: 20
     env:
       APP_URL: https://marketdash1.streamlit.app/
       HOLD_SECONDS: '25'
@@ -54,6 +59,17 @@ jobs:
 
       - name: Wake the app and verify it renders
         run: python3 .github/scripts/keep_alive.py
+
+      # Screenshot, page HTML and the platform's status history, so a failed run
+      # shows what the runner actually saw instead of leaving it to guesswork.
+      - name: Keep the diagnostics if the app did not come up
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: keep-alive-diagnostics
+          path: keep-alive-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
 
       # GitHub automatically disables scheduled workflows in a public repo after
       # 60 days with no repository activity, which would silently kill this whole
