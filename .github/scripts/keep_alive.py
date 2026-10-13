@@ -3,22 +3,29 @@
 and check it still renders.
 
 How Community Cloud decides what a visitor sees, read from its own hosting
-page code (2026-10-13):
+page code and checked against the live platform (2026-10-13):
 
-  GET  /api/v2/app/status            -> {"status": N, "platformStatus": P, ...}
+  GET  /api/v2/app/status  -> {"status": N, ...} plus an x-csrf-token header.
          5 RUNNING, 12 IS_SHUTDOWN (asleep), 0/1/2/3/4/6/7 booting or updating,
          8-11/13 deleted or failed. The hosting page polls this itself.
-  POST /api/v2/subdomain/app/resume  -> exactly what the "Yes, get this app
-                                        back up!" button sends. Open to any
-                                        visitor, which is why the button is.
+  POST /api/v2/app/resume  -> what the "Yes, get this app back up!" button
+                              sends. Open to any visitor, but like every POST
+                              it must send the latest x-csrf-token back, or
+                              the platform answers 403.
 
-The first version of this script read the sleep page's text and pressed its
-button. That page is a heavy client-side app, and on GitHub's headless runner
-it never rendered the button, so a sleeping app was never woken - every
-earlier "success" was the app already being awake. This version asks the
-status endpoint what state the app is in and sends the same resume request
-the button sends, from inside the page, so nothing depends on that page
-rendering. The button is still tried if the request is refused.
+The page's API client names these /subdomain/app/...; its request interceptor
+rewrites that to /api/v2/app/... before sending, and the platform's proxy adds
+/subdomain back on the server side. So /api/v2/subdomain/... from a browser
+reaches /api/v2/subdomain/subdomain/... and fails.
+
+The first version of this script judged the app's state from the page text.
+On 2026-10-13 the runner got the "taking longer than normal" loader instead
+of the sleep page, took it for an awake app, and never pressed the button.
+This version asks the status endpoint instead and sends the resume request
+itself, the way the page's client builds it, so nothing depends on what the
+page happens to render. The button on the page stays as the fallback: on the
+first live run the resume request used the wrong path and no token, was
+refused, and the button woke the app.
 
 Success is decided the same way as before: a real browser session that opens
 the app's /_stcore/stream websocket and renders real content, because that is
@@ -51,7 +58,7 @@ RESUME_RETRY_S = float(os.environ.get("RESUME_RETRY_S", "60"))
 ARTIFACT_DIR = os.environ.get("ARTIFACT_DIR", "keep-alive-diagnostics")
 
 STATUS_PATH = "/api/v2/app/status"
-RESUME_PATH = "/api/v2/subdomain/app/resume"
+RESUME_PATH = "/api/v2/app/resume"
 STREAM_PATH = "/_stcore/stream"
 
 # Community Cloud's own APP_STATUS enum.
@@ -67,14 +74,22 @@ FAILED = {8, 9, 10, 11, 13}      # deleted, or the app could not start
 
 WAKE_BUTTON = '[data-testid="wakeup-button-viewer"], [data-testid="wakeup-button-owner"]'
 
-# Same-origin fetches made from inside the page, so they carry exactly the
-# cookies, origin and headers the hosting page's own requests carry.
+# Same-origin requests made from inside the page and built the way the hosting
+# page's own API client builds them: every response may hand out a fresh
+# x-csrf-token, every POST sends the latest one back, and the browser's
+# machineId from localStorage goes along as x-streamlit-machine-id.
 JS_FETCH = """async ([path, method]) => {
+  const headers = {};
+  if (method !== 'GET' && window.__keepAliveCsrf) headers['x-csrf-token'] = window.__keepAliveCsrf;
+  try { const id = localStorage.getItem('machineId'); if (id) headers['x-streamlit-machine-id'] = id; } catch (e) {}
+  const sentToken = 'x-csrf-token' in headers;
   try {
-    const r = await fetch(path, {method, credentials: 'include', cache: 'no-store'});
-    return {ok: r.ok, http: r.status, body: (await r.text()).slice(0, 400)};
+    const r = await fetch(path, {method, headers, credentials: 'include', cache: 'no-store'});
+    const token = r.headers.get('x-csrf-token');
+    if (token) window.__keepAliveCsrf = token;
+    return {ok: r.ok, http: r.status, body: (await r.text()).slice(0, 400), sentToken};
   } catch (e) {
-    return {ok: false, http: 0, body: String(e).slice(0, 400)};
+    return {ok: false, http: 0, body: String(e).slice(0, 400), sentToken};
   }
 }"""
 
@@ -121,8 +136,10 @@ def press_wake_button(page) -> bool:
 
 
 def wake(page) -> None:
+    call(page, STATUS_PATH)   # a fresh read hands out the token the POST must carry
     res = call(page, RESUME_PATH, "POST")
-    log(f"resume   : HTTP {res['http']} {res['body'][:160]!r}")
+    token = "sent" if res.get("sentToken") else "MISSING"
+    log(f"resume   : HTTP {res['http']} (csrf token {token}) {res['body'][:160]!r}")
     if res["ok"]:
         return
     log("resume   : request refused - trying the button on the page instead")
