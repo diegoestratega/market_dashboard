@@ -4,14 +4,24 @@ name: Keep Streamlit app awake
 # This opens a real browser session against the deployment on a schedule, which
 # resets that clock and also tells us the dashboard still renders.
 #
-# Schedule: every 11 hours -> 00:00, 11:00 and 22:00 UTC (largest gap 11h).
-# That leaves only ~1h of margin under the 12h sleep threshold, and GitHub's
-# scheduled runs are routinely delayed under load. Changing */11 to */6 below
-# costs nothing on a public repo and removes that risk.
+# Schedule: hourly, at minute 17 (UTC).
+#
+# This ran every 11 hours (00:00/11:00/22:00 UTC) from 2026-09-18 to 2026-10-13
+# and the app still slept every day. GitHub never created the third run - 53
+# scheduled runs in 25 days, two a day - and the ones it did create fired late:
+# the 11:00 slot landed between 15:00 and 20:03 UTC. That left a 14-19 hour
+# gap daily, past the 12h threshold, right across the US market open.
+#
+# Two changes, both straight from GitHub's own guidance on schedule delays:
+#   - minute 17, not 0: the top of the hour is when scheduled runs are most
+#     delayed and most often dropped
+#   - hourly: one dropped or late run no longer opens a gap. It would take
+#     roughly a dozen consecutive misses to reach 12 hours untouched.
+# Free on a public repo; each run is about a minute.
 
 on:
   schedule:
-    - cron: '0 */11 * * *'
+    - cron: '17 * * * *'
   workflow_dispatch:
 
 # Needed only by the heartbeat step at the end.
